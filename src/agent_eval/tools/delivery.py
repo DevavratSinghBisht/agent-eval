@@ -122,7 +122,7 @@ class PaginatePolicy(DeliveryPolicy):
 
 
 class SummarizePolicy(DeliveryPolicy):
-    """Outputs above `threshold_tokens` are replaced by a question-focused LLM summary."""
+    """Outputs above `threshold_tokens` are replaced by a task-focused LLM summary."""
 
     def __init__(self, threshold_tokens: int = 2000):
         self.threshold_chars = threshold_tokens * CHARS_PER_TOKEN
@@ -131,9 +131,9 @@ class SummarizePolicy(DeliveryPolicy):
     async def apply(self, raw, ctx):
         if len(raw) <= self.threshold_chars or ctx.summarize is None:
             return raw, self._meta(raw, raw, False, summarized=False), None, 0.0
-        summary, usage, cost = await ctx.summarize(raw, ctx.question)
+        summary, usage, cost = await ctx.summarize(raw, ctx.prompt)
         delivered = (
-            f"[Summary of a {approx_tokens(raw)}-token result, written for the current question. "
+            f"[Summary of a {approx_tokens(raw)}-token result, written for the current task. "
             f"Details not in this summary are not shown.]\n{summary}"
         )
         return delivered, self._meta(raw, delivered, True, summarized=True), usage, cost

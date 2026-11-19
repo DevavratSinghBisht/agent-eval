@@ -26,8 +26,8 @@ def _hl(text: str, pattern: re.Pattern | None) -> str:
 
 
 def render(traj: dict, out: Path) -> Path:
-    ans = traj.get("correct_answer") or ""
-    variants = [v for v in answer_variants(ans) if len(v) >= 3]
+    ans = str(traj.get("reference") or "")
+    variants = sorted({v for s in traj.get("evidence_strings") or [] for v in answer_variants(str(s)) if len(v) >= 3})
     pat = re.compile("|".join(re.escape(html.escape(v)) for v in sorted(variants, key=len, reverse=True)), re.I) if variants else None
     closing = next((s for s in traj["steps"] if s.get("closing")), {})
     res = closing.get("passed")
@@ -36,8 +36,8 @@ def render(traj: dict, out: Path) -> Path:
         f"<title>Trajectory viewer</title><style>{CSS}</style></head><body>",
         f"<h1>{html.escape(traj['run_id'])} / {html.escape(traj['task_id'])}</h1>",
         f"<p class='meta'>Result: <b class='{'ok' if res else 'err'}'>{'PASS' if res else 'FAIL'}</b> · termination "
-        f"{html.escape(str(closing.get('termination_reason')))} · gold answer <mark>{html.escape(ans)}</mark></p>",
-        f"<details open><summary>Question</summary><pre>{html.escape(traj.get('question', ''))}</pre></details>",
+        f"{html.escape(str(closing.get('termination_reason')))} · reference <mark>{html.escape(ans)}</mark></p>",
+        f"<details open><summary>Task</summary><pre>{html.escape(traj.get('prompt', ''))}</pre></details>",
     ]
     for s in traj["steps"]:
         if s.get("closing"):

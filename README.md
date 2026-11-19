@@ -1,9 +1,23 @@
 # agent-eval
 
-A research harness for tool-calling LLM agents. **Current scope:** BrowseComp (live web) and
-BrowseComp-Plus (fixed ~100K-document corpus), Claude Haiku 5.5 as the first model, full-fidelity
-logging, integrity validation, and failure analysis with strategic ablations. Runs on Windows in a
-conda env — no Docker or WSL.
+A **benchmark-neutral** research harness for tool-calling LLM agents. It provides full-fidelity
+logging, integrity validation, failure analysis and strategic ablations, for any benchmark you plug
+in. Runs on Windows in a conda env, with no Docker or WSL.
+
+**Benchmarks are plugins** (`agent-eval benchmarks`):
+
+| id | what it is |
+|---|---|
+| `jsonl_qa` | bring your own JSONL of questions and answers, no code needed (`configs/experiments/example_jsonl.yaml`) |
+| `browsecomp` | reference plugin: OpenAI BrowseComp (live web, official grader) |
+| `browsecomp_plus` | reference plugin: BrowseComp-Plus (fixed ~100K-doc corpus with labelled evidence documents) |
+| `your.module:YourClass` | any `Benchmark` subclass. See **[docs/ADDING_A_BENCHMARK.md](docs/ADDING_A_BENCHMARK.md)** and `src/agent_eval/benchmarks/_template.py`. |
+
+A plugin implements `load_tasks()` and `grade()`. Everything else is shared: the agent loop and
+budgets, the tool registry and named toolsets, delivery policies, the leak blocklist, the
+CSV/trajectory logging, the validator, the evidence funnel, failure signals, the LLM failure
+labeller and the reports. Reusable graders are provided: exact match, a template LLM judge, and a
+rubric judge.
 
 Design rationale (standards review of Anthropic / OpenAI / Google / Mercor agent guidance) is in the
 approved plan; the short version: a **single tool-calling agent first**, with a planner–evaluator
@@ -15,19 +29,21 @@ loop added later as a drop-in strategy under identical tools, budgets and loggin
 conda create -n agent-eval python=3.13 -y
 conda activate agent-eval
 pip install -e ".[dev]"
-copy .env.example .env      # then fill ANTHROPIC_API_KEY and TAVILY_API_KEY (or EXA_API_KEY)
-pytest                      # 20 offline tests (scripted model, mock web, mock corpus)
+copy .env.example .env      # then fill ANTHROPIC_API_KEY and EXA_API_KEY (or TAVILY_API_KEY)
+pytest                      # 32 offline tests (scripted model, mock web, mock corpus, test plugin)
 ```
 
-Optional, for the local-docs / oracle-docs experiments (downloads ~3 GB, builds a BM25 index):
+One-time data preparation (download, decryption, corpus index) for a benchmark:
 
 ```powershell
-agent-eval prepare browsecomp_plus
+agent-eval prepare browsecomp_plus                         # by id (BrowseComp-Plus: ~3 GB + BM25 index)
+agent-eval prepare configs/experiments/example_jsonl.yaml  # or via an experiment (plugins with params)
 ```
 
 ## Running
 
 ```powershell
+agent-eval run configs/experiments/example_jsonl.yaml  # 6-question generic example, < $0.10
 agent-eval run configs/experiments/pilot.yaml          # ~5 questions, $5 cap: always run this first
 agent-eval trajectory runs/pilot <run_id> <task_id> --html t.html   # read the traces
 agent-eval run configs/experiments/baseline.yaml       # 100 Qs x 3 repeats
@@ -43,14 +59,14 @@ reported automatically (`finalize`, `validate` and `report` are also separate co
 
 ## Experiments
 
-**Tool conditions** (`condition`):
+**Toolsets** (`condition`). These are the built-ins. Benchmarks and experiment YAMLs can add their own (`toolsets:`), and new tools register with `@register_tool`:
 
 | id | tools | question it answers |
 |---|---|---|
 | `closed_book` | final_answer only | internal-knowledge floor / contamination |
 | `search_snippets` | web_search (snippets only) | value of search ranking alone |
 | `search_fetch` | web_search + web_fetch | standard browsing agent |
-| `local_docs` | search_docs + read_doc (BrowseComp-Plus) | closed-corpus retrieval |
+| `local_docs` | search_docs + read_doc over the benchmark's `corpus_dir()` | closed-corpus retrieval |
 | `search_docs` | all four | combination effects |
 | `oracle_docs` | read_doc on the gold evidence docs | reasoning ceiling with perfect retrieval |
 
@@ -60,9 +76,10 @@ results). Raw *and* delivered outputs are both logged for every tool call.
 
 **Evidence funnel.** Every executed task is placed on `retrieved → delivered → attended → correct`.
 A failure is attributed to the first broken link: `retrieval_miss`, `truncation_loss`,
-`comprehension_miss`, `synthesis_error`, `format_or_grading`, `knowledge_miss` (closed book), or
-`no_answer_<cap>`. Matching uses the normalized gold answer string. For BrowseComp-Plus it also
-uses the gold and evidence docids.
+`comprehension_miss`, `synthesis_error`, `format_or_grading`, `knowledge_miss` (no research tools), or
+`no_answer_<cap>`. Evidence comes from each task's `Evidence`: `answer_strings` (normalized gold
+answer, aliases or key facts) and/or `doc_ids` in the benchmark's corpus. Benchmarks that define no
+evidence get `unattributed_failure`.
 
 ## Output layout (`runs/<campaign>/`)
 
@@ -71,7 +88,7 @@ Modelled on the Mercor loss-analysis package in `example_logs/`:
 | file | contents |
 |---|---|
 | `runs.csv` | one row per run: model, harness, condition, delivery, effort, budget, `config_hash`, `repeat_group_id`, `runner_version`, `price_catalog_version`, status, expected/executed/passed counts, token and cost totals. No stored score. |
-| `tasks.csv` | full (run × task) grid **including `not_executed`**: status, passed, termination reason, tokens, cost, answer, confidence, grader output, funnel flags and category, failure signals |
+| `tasks.csv` | full (run × task) grid **including `not_executed`**: status, passed, score, termination reason, tokens, cost, answer, reference, confidence, `meta_*` (task metadata), `grade_*` (grader details), funnel flags and category, failure signals |
 | `model_calls.csv` | one row per model call: `call_index`, `harness_phase`, uncached / cached / cache-write / completion tokens, stop reason, latency, `exception_type`, cost |
 | `tool_calls.csv` | one row per tool call: raw vs delivered tokens, truncated, pages, answer-in-raw / answer-in-delivered, gold-doc hit, fees |
 | `trajectories/archive.jsonl.zst` | one record per task. Each record has one step per model call (same order, phase and usage as `model_calls.csv`) plus a closing step. Steps hold reasoning, text, raw response, and each tool call's input with its raw output, delivered output and delivery metadata. |
@@ -96,13 +113,13 @@ Modelled on the Mercor loss-analysis package in `example_logs/`:
 - Flags partial runs, mixed runner versions, cached-share anomalies between repeats, and grader parse failures.
 
 ## Notes and assumptions to verify
-- **simple-evals bug fixed:** its grader compares `match.group(0)` (`"correct: yes"`) to `"yes"`, so it never scores a correct answer. We compare the captured group.
+- **BrowseComp plugin, simple-evals bug fixed:** its grader compares `match.group(0)` (`"correct: yes"`) to `"yes"`, so it never scores a correct answer. We compare the captured group.
 - **Price catalog:** Haiku 5.5 prices come from Anthropic's model table. Two things are assumptions: the cache multipliers (read 0.1×, write 1.25×), and that the >100K-prompt tier applies per call. Check them against the pricing page and bump `version` if they change.
-- **Search backends:** Tavily and Exa are implemented against their public REST APIs but haven't been exercised with real keys yet. The pilot will confirm them.
-- **Answer-leak blocklist:** search results and fetches skip URLs that mirror benchmark data (`tools/web.py`, extendable via `AGENT_EVAL_BLOCKLIST`).
+- **Search backends:** Exa has been verified live. Tavily is implemented but untested with a real key. Rate limits (429) and 5xx errors are retried with backoff, and the status code is logged.
+- **Answer-leak blocklist:** search results and fetches skip dataset mirrors and data files on code hosts (generic). Each benchmark adds its own `leak_patterns`, and `AGENT_EVAL_BLOCKLIST` adds more. Trials that still hit one are flagged `leak_suspect` and excluded from scores.
 - **Commit before campaigns:** `runner_version` includes the git SHA, and shows `nogit` / `-dirty` otherwise.
 
 ## Roadmap
 - **Phase 4:** OpenAI, Gemini and OpenAI-compatible (vLLM / Ollama) providers behind `providers/base.py`, plus a provider conformance suite.
 - **Phase 5:** `planner_evaluator` harness (planner → executor → evaluator loop), compared to `direct_tool` in a crossed, matched design.
-- **Later:** APEX-Agents (Corporate Lawyer) and APEX-Accounting through Mercor's Harbor runtime (needs Docker).
+- **Later:** APEX-Agents (Corporate Lawyer) and APEX-Accounting through Mercor's Harbor runtime (needs Docker), as plugins using `grade_rubric` and MCP-backed tools.

@@ -23,7 +23,7 @@ from ..core.pricing import load_catalog
 
 RUN_META_COLS = [
     "run_id", "campaign_id", "benchmark_id", "model_name", "provider", "harness_name", "condition_id",
-    "delivery_policy", "effort", "search_backend", "token_budget_per_task", "step_cap", "repeat_index",
+    "toolset_tools", "delivery_policy", "effort", "search_backend", "token_budget_per_task", "step_cap", "repeat_index",
     "repeat_group_id", "config_hash", "runner_version", "price_catalog_version", "seed", "grader_model",
 ]
 TOKEN_COLS = ["prompt_tokens", "cached_tokens", "cache_write_tokens", "completion_tokens"]
@@ -41,7 +41,44 @@ def load_work(run_dir: Path, task_id: str, run_meta: dict[str, Any]) -> dict[str
     w = json.loads(p.read_text(encoding="utf-8"))
     w["condition_id"] = run_meta["condition_id"]
     w["delivery_policy"] = run_meta["delivery_policy"]
+    _upgrade_legacy(w, run_meta)
     return w
+
+
+LEGACY_TOOLSETS = {  # pre-plugin runs did not record their tool list
+    "closed_book": [], "search_snippets": ["web_search_snippets"], "search_fetch": ["web_search", "web_fetch"],
+    "local_docs": ["search_docs", "read_doc"], "search_docs": ["web_search", "web_fetch", "search_docs", "read_doc"],
+    "oracle_docs": ["read_doc_oracle"],
+}
+
+
+def _upgrade_legacy(w: dict[str, Any], run_meta: dict[str, Any]) -> None:
+    """Map work records written before the benchmark-plugin refactor onto the current schema, so
+    old campaigns (BrowseComp pilot/ablation) can still be finalized and analysed."""
+    t = w["task"]
+    if "evidence" not in w:
+        meta = w.get("task_metadata") or {}
+        w["evidence"] = {
+            "answer_strings": [t["correct_answer"]] if t.get("correct_answer") else [],
+            "doc_ids": list(dict.fromkeys((meta.get("evidence_docids") or []) + (meta.get("gold_docids") or []))),
+        }
+        w["prompt"] = w.get("question", "")
+        w["trajectory"].setdefault("prompt", w["prompt"])
+        w["trajectory"].setdefault("reference", t.get("correct_answer"))
+        w["trajectory"].setdefault("evidence_strings", w["evidence"]["answer_strings"])
+        w["leak_patterns"] = ["browsecomp", "browse_comp", "bcplus", "bc-plus", "simple-evals"]
+        t.setdefault("answer", t.pop("exact_answer", None))
+        t.setdefault("reference", t.pop("correct_answer", None))
+        t.setdefault("score", None if t.get("passed") is None else float(bool(t.get("passed"))))
+        for old, new in (("grader_parse_ok", "grade_parse_ok"), ("grader_verdict", "grade_verdict"),
+                         ("grader_extracted_answer", "grade_extracted_final_answer"), ("grader_raw", "grade_raw")):
+            if old in t:
+                t[new] = t.pop(old)
+        t.setdefault("meta_topic", t.pop("topic", None))
+    if "toolset_tools" not in w:
+        tools = run_meta.get("toolset_tools")
+        w["toolset_tools"] = tools.split(",") if tools else LEGACY_TOOLSETS.get(run_meta["condition_id"], [])
+        run_meta.setdefault("toolset_tools", ",".join(w["toolset_tools"]))
 
 
 def finalize(campaign_dir: str | Path, n_selected: int = 10) -> dict[str, Path]:

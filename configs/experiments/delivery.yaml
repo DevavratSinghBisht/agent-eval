@@ -1,3 +1,4 @@
+# Benchmark: BrowseComp reference plugin (see docs/ADDING_A_BENCHMARK.md for your own).
 # Delivery-policy sweep: does the model consume full results, or only what fits a truncation window?
 # Local-docs condition keeps retrieval fixed so differences come from delivery, not the web.
 campaign_id: delivery_sweep

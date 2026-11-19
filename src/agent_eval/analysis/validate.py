@@ -100,8 +100,8 @@ def validate(campaign_dir: str | Path) -> dict:
                 add("error", "trajectory_step_mismatch", f"{ti.iloc[0].n_steps} steps for {n_calls} calls (+1 closing expected)", *key)
         if t.task_status == "grading_error":
             add("warning", "grading_error", "grader failed; re-run `agent-eval regrade`", *key)
-        if t.task_status == "completed" and t.get("grader_parse_ok") is False:
-            add("warning", "grader_parse_fail", "grader output had no 'correct: yes|no'; scored as no", *key)
+        if t.task_status == "completed" and t.get("grade_parse_ok") is False:
+            add("warning", "grader_parse_fail", "grader output had no parseable verdict; scored as not passed", *key)
         if t.get("leak_suspect") is True:
             add("warning", "leak_suspect", f"excluded from performance stats: {t.get('leak_reason')}", *key)
 

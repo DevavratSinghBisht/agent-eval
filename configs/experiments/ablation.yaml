@@ -1,3 +1,4 @@
+# Benchmark: BrowseComp reference plugin (see docs/ADDING_A_BENCHMARK.md for your own).
 # Tool-access ablation on the SAME BrowseComp-Plus questions (paired comparisons).
 # Requires `agent-eval prepare browsecomp_plus` (downloads ~3 GB + builds a BM25 index).
 campaign_id: ablation_tools

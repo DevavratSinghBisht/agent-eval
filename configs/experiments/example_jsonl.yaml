@@ -1,0 +1,20 @@
+# Template experiment for the generic JSONL benchmark: point `params.path` at your own file.
+# Exact-match grading is free; switch `grader: llm_judge` for free-form answers.
+campaign_id: example_jsonl
+benchmark:
+  id: jsonl_qa
+  params:
+    path: examples/data/sample_qa.jsonl
+    grader: exact_match
+grader: {provider: anthropic, model: claude-haiku-5-5, effort: low}   # used only by llm_judge
+repeats: 1
+concurrency: 4
+max_cost_usd: 1.0
+defaults:
+  model: {provider: anthropic, name: claude-haiku-5-5, effort: low, max_tokens: 4000, thinking_display: summarized}
+  harness: direct_tool
+  delivery: full
+  search_backend: exa
+  limits: {step_cap: 10, token_budget_per_task: 200000, time_cap_s: 300, cost_cap_usd: 0.10}
+matrix:
+  condition: [closed_book, search_snippets]

@@ -1,6 +1,8 @@
-"""Local-corpus tools over the BrowseComp-Plus corpus (~100K docs), BM25 via bm25s.
+"""Local-corpus tools (search_docs / read_doc) over any document collection, BM25 via bm25s.
 
-The index is built once (`agent-eval prepare browsecomp_plus`) and cached under data/.
+A corpus directory holds `corpus.jsonl` (one {"docid", "text", "url"?, "title"?} per line); the
+BM25 index (`bm25_index/`, `docid_order.json`) is built once with `Corpus.build_index(dir)`,
+typically from a benchmark's `prepare()`. Benchmarks expose their corpus via `corpus_dir()`.
 """
 
 from __future__ import annotations
@@ -30,35 +32,35 @@ class Corpus:
     def from_records(cls, records: list[dict[str, str]]) -> "Corpus":
         import bm25s
 
-        docs = {str(r["docid"]): {"text": r["text"], "url": r.get("url", ""), "title": _title(r["text"])} for r in records}
+        docs = {str(r["docid"]): _doc(r) for r in records}
         order = list(docs)
         retriever = bm25s.BM25()
         retriever.index(bm25s.tokenize([docs[d]["text"] for d in order], stopwords="en", show_progress=False), show_progress=False)
         return cls(docs, retriever, order)
 
     @classmethod
-    def load(cls, data_dir: str | Path) -> "Corpus":
-        key = str(Path(data_dir).resolve())
+    def load(cls, corpus_dir: str | Path) -> "Corpus":
+        key = str(Path(corpus_dir).resolve())
         with cls._lock:
             if key not in cls._instances:
                 import bm25s
 
-                d = Path(data_dir) / "browsecomp_plus"
+                d = Path(corpus_dir)
                 docs = {}
                 with open(d / "corpus.jsonl", encoding="utf-8") as fh:
                     for line in fh:
                         r = json.loads(line)
-                        docs[str(r["docid"])] = {"text": r["text"], "url": r.get("url", ""), "title": _title(r["text"])}
+                        docs[str(r["docid"])] = _doc(r)
                 order = json.loads((d / "docid_order.json").read_text(encoding="utf-8"))
                 retriever = bm25s.BM25.load(str(d / "bm25_index"))
                 cls._instances[key] = cls(docs, retriever, order)
             return cls._instances[key]
 
     @staticmethod
-    def build_index(data_dir: str | Path) -> None:
+    def build_index(corpus_dir: str | Path) -> None:
         import bm25s
 
-        d = Path(data_dir) / "browsecomp_plus"
+        d = Path(corpus_dir)
         order, texts = [], []
         with open(d / "corpus.jsonl", encoding="utf-8") as fh:
             for line in fh:
@@ -79,6 +81,10 @@ class Corpus:
             return []
         results, scores = self.retriever.retrieve(tokens, k=min(k, len(self.docid_order)), show_progress=False)
         return [self.docid_order[int(i)] for i, s in zip(results[0], scores[0]) if s > 0]
+
+
+def _doc(r: dict) -> dict[str, str]:
+    return {"text": r["text"], "url": r.get("url", "") or "", "title": r.get("title") or _title(r["text"])}
 
 
 def _title(text: str) -> str:

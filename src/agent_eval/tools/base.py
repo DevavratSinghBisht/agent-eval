@@ -59,7 +59,7 @@ class Tool:
 
 @dataclass
 class ToolContext:
-    question: str
+    prompt: str  # the task prompt (used by question-focused delivery policies)
     task_id: str
     results: dict[str, list[str]] = field(default_factory=dict)  # result_id -> pages (paginate)
     summarize: SummarizeFn | None = None

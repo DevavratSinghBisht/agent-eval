@@ -1,8 +1,9 @@
-"""End-to-end campaign with a scripted model, mock web and a tiny local corpus.
+"""End-to-end campaigns with a scripted model, mock web and a tiny local corpus, run through a
+test-only benchmark plugin (proves the harness has no BrowseComp dependency).
 
-Checks: every condition and delivery policy runs; logging invariants hold; the evidence
-funnel attributes the planted truncation loss correctly; resume works; the validator catches
-injected faults."""
+Checks: every toolset and delivery policy runs; logging invariants hold; the evidence funnel
+attributes the planted truncation loss correctly; custom toolsets work; resume works; the
+validator catches injected faults."""
 
 import json
 import re
@@ -13,12 +14,12 @@ import pytest
 
 from agent_eval.analysis.report import build_report
 from agent_eval.analysis.validate import validate
-from agent_eval.benchmarks.browsecomp import Task
+from agent_eval.benchmarks import Benchmark, Evidence, Task
 from agent_eval.core.config import ExperimentConfig, GraderConfig
 from agent_eval.core.pricing import load_catalog
+from agent_eval.graders import Judge, exact_match
 from agent_eval.providers.mock_client import MockClient
 from agent_eval.runner.campaign import Campaign
-from agent_eval.runner.grading import Grader
 from agent_eval.tools.local_docs import Corpus
 from agent_eval.tools.web import MockBackend
 from agent_eval.tracing.store import finalize, get_trajectory
@@ -28,11 +29,39 @@ ANSWER = "Zanzibar"
 LONG_PAGE = ("filler text about islands and spices. " * 1100) + f" The festival was first held in {ANSWER} in 1998. " + ("more filler. " * 200)
 
 
+class IslandBench(Benchmark):
+    """Minimal plugin: two in-memory QA tasks, a two-document corpus, exact-match grading."""
+
+    id = "island_test"
+    leak_patterns = ["island-bench-dump"]
+
+    def __init__(self, cfg, corpus_dir):
+        super().__init__(cfg)
+        self._corpus_dir = corpus_dir
+
+    def load_tasks(self):
+        ev = Evidence(answer_strings=[ANSWER], doc_ids=["d1"])
+        return [
+            Task("isl-1", "Which island first held the spice festival?", ANSWER, {"topic": "geo"}, ev),
+            Task("isl-2", "Which island first held the spice festival (variant)?", ANSWER, {"topic": "geo"}, ev),
+        ]
+
+    def corpus_dir(self):
+        return self._corpus_dir
+
+    async def grade(self, task, response, answer, judge):
+        return exact_match((answer or {}).get("answer", ""), [task.reference])
+
+
 def agent_script(messages, tools):
     names = {t.name for t in tools}
     seen = "\n".join(r.content for m in messages for r in m.tool_results)
     n_tool_msgs = sum(1 for m in messages if m.tool_results)
-    final = lambda ans, c: {"tool_calls": [("final_answer", {"explanation": "found", "exact_answer": ans, "confidence": c})]}  # noqa: E731
+    final = lambda ans, c: {"tool_calls": [("final_answer", {"explanation": "found", "answer": ans, "confidence": c})]}  # noqa: E731
+    first = messages[0].text
+    m = re.search(r"Relevant document ids: (.+)", first)
+    if m and not any(mm.tool_results for mm in messages):  # oracle_docs: ids are in the task prompt
+        return {"tool_calls": [("read_doc", {"docid": m.group(1).split(",")[0].strip()})]}
     if ANSWER in seen:
         return final(ANSWER, 90)
     page = re.search(r'result_id="(r[0-9a-f]+)" and page=2\.\.(\d+)', seen)
@@ -54,25 +83,8 @@ def agent_script(messages, tools):
         return {"tool_calls": [("search_docs", {"query": "festival islands spices first held"})]}
     if "read_doc" in names:
         m = re.search(r"docid: (\S+)", seen)
-        docid = m.group(1) if m else "d1"
-        return {"tool_calls": [("read_doc", {"docid": docid})]}
+        return {"tool_calls": [("read_doc", {"docid": m.group(1) if m else "d1"})]}
     return final("Madagascar", 60)
-
-
-def oracle_aware_script(messages, tools):
-    # oracle_docs: docids are listed in the first user message
-    first = messages[0].text
-    m = re.search(r"Relevant document ids: (.+)", first)
-    if m and not any(mm.tool_results for mm in messages):
-        return {"tool_calls": [("read_doc", {"docid": m.group(1).split(",")[0].strip()})]}
-    return agent_script(messages, tools)
-
-
-def grader_script(messages, tools):
-    resp = messages[0].text
-    exact = re.search(r"Exact Answer: (.*)", resp.split("[response]:", 1)[1]).group(1)
-    ok = ANSWER.lower() in exact.lower()
-    return {"text": f"extracted_final_answer: {exact}\nreasoning: compare\ncorrect: {'yes' if ok else 'no'}\nconfidence: 90", "stop": "end_turn"}
 
 
 @pytest.fixture
@@ -81,26 +93,22 @@ def setup(tmp_path):
         "https://example.org/festival": ("Island spice festival history", LONG_PAGE),
         "https://example.org/other": ("Unrelated islands page", "islands spices " * 50),
     }
-    data_dir = tmp_path / "data"
-    corpus = Corpus.from_records(
+    corpus_dir = tmp_path / "corpus"
+    Corpus._instances[str(Path(corpus_dir).resolve())] = Corpus.from_records(
         [
             {"docid": "d1", "text": "title: Spice festival\n" + LONG_PAGE, "url": "https://example.org/festival"},
             {"docid": "d2", "text": "title: Other\nislands " * 30, "url": "https://example.org/other"},
         ]
     )
-    Corpus._instances[str(Path(data_dir).resolve())] = corpus
-    tasks = [
-        Task("bcp-1", "Which island first held the spice festival?", ANSWER, {"gold_docids": ["d1"], "evidence_docids": ["d1"]}),
-        Task("bcp-2", "Which island first held the spice festival (variant)?", ANSWER, {"gold_docids": ["d1"], "evidence_docids": []}),
-    ]
-    return tmp_path, data_dir, tasks
+    return tmp_path, corpus_dir
 
 
-def make_campaign(tmp_path, data_dir, tasks, matrix, campaign_id="e2e", repeats=1):
+def make_campaign(tmp_path, corpus_dir, matrix, campaign_id="e2e", repeats=1, toolsets=None):
     exp = ExperimentConfig(
         campaign_id=campaign_id,
-        benchmark={"id": "browsecomp_plus", "data_dir": str(data_dir)},
+        benchmark={"id": "island_test"},
         grader=GraderConfig(provider="mock", model="mock-model"),
+        toolsets=toolsets or {},
         defaults={
             "model": {"provider": "mock", "name": "mock-model", "effort": None, "thinking_display": None},
             "search_backend": "mock",
@@ -112,18 +120,15 @@ def make_campaign(tmp_path, data_dir, tasks, matrix, campaign_id="e2e", repeats=
         concurrency=4,
         max_cost_usd=100,
     )
-
-    def factory(provider, model):
-        return MockClient(model, oracle_aware_script)
-
-    grader = Grader(exp.grader, load_catalog(), MockClient("mock-model", grader_script))
-    return Campaign(exp, root=tmp_path / "runs", client_factory=factory, grader=grader, tasks=tasks)
+    judge = Judge(MockClient("mock-model"), "mock-model", load_catalog())
+    return Campaign(exp, root=tmp_path / "runs", client_factory=lambda p, m: MockClient(m, agent_script),
+                    benchmark=IslandBench(exp.benchmark, corpus_dir), judge=judge)
 
 
 async def test_full_matrix_logging_and_funnel(setup):
-    tmp_path, data_dir, tasks = setup
+    tmp_path, corpus_dir = setup
     camp = make_campaign(
-        tmp_path, data_dir, tasks,
+        tmp_path, corpus_dir,
         {
             "condition": ["closed_book", "search_fetch", "search_snippets", "local_docs", "oracle_docs"],
             "delivery": ["full", "truncate_2k", "paginate_8k", "summarize"],
@@ -138,9 +143,10 @@ async def test_full_matrix_logging_and_funnel(setup):
     tasks_df = pd.read_csv(camp.dir / "tasks.csv")
     calls = pd.read_csv(camp.dir / "model_calls.csv")
     assert len(runs) == 20 and len(tasks_df) == 40
-    assert set(runs.run_status) == {"finished"}
+    assert set(runs.run_status) == {"finished"} and set(runs.benchmark_id) == {"island_test"}
     assert runs.runner_version.notna().all() and runs.price_catalog_version.notna().all()
     assert set(calls.harness_phase) <= {"execution", "recovery", "finalization"}
+    assert {"answer", "reference", "score", "meta_topic", "grade_method"} <= set(tasks_df.columns)
 
     t = tasks_df.merge(runs[["run_id", "condition_id", "delivery_policy"]], on="run_id")
     cell = lambda c, d: t[(t.condition_id == c) & (t.delivery_policy == d)]  # noqa: E731
@@ -154,36 +160,45 @@ async def test_full_matrix_logging_and_funnel(setup):
 
     # trajectory archive: one step per call + closing step, fetchable by id
     r0 = runs.run_id.iloc[0]
-    traj = get_trajectory(camp.dir, r0, "bcp-1")
-    n_calls = len(calls[(calls.run_id == r0) & (calls.task_id == "bcp-1")])
+    traj = get_trajectory(camp.dir, r0, "isl-1")
+    n_calls = len(calls[(calls.run_id == r0) & (calls.task_id == "isl-1")])
     assert len(traj["steps"]) == n_calls + 1 and traj["steps"][-1]["closing"]
+    assert traj["prompt"].startswith("Which island")
     assert build_report(camp.dir).exists()
 
 
+async def test_custom_toolset_and_unknown_condition(setup):
+    tmp_path, corpus_dir = setup
+    camp = make_campaign(tmp_path, corpus_dir, {"condition": ["docs_only"]}, campaign_id="custom",
+                         toolsets={"docs_only": ["search_docs", "read_doc"]})
+    await camp.run()
+    finalize(camp.dir)
+    runs = pd.read_csv(camp.dir / "runs.csv")
+    assert runs.toolset_tools.iloc[0] == "search_docs,read_doc"
+    assert pd.read_csv(camp.dir / "tasks.csv").passed.all()
+    with pytest.raises(ValueError, match="unknown condition"):
+        make_campaign(tmp_path, corpus_dir, {"condition": ["no_such_toolset"]}, campaign_id="bad")
+
+
 async def test_resume_partial_and_fault_injection(setup):
-    tmp_path, data_dir, tasks = setup
-    camp = make_campaign(tmp_path, data_dir, tasks, {"condition": ["search_fetch"]}, campaign_id="resume", repeats=2)
+    tmp_path, corpus_dir = setup
+    camp = make_campaign(tmp_path, corpus_dir, {"condition": ["search_fetch"]}, campaign_id="resume", repeats=2)
     await camp.run()
     # simulate a crash: delete one task record -> partial run with a not_executed row
-    victim = next(camp.work.glob("*/tasks/bcp-2.json"))
-    victim.unlink()
+    next(camp.work.glob("*/tasks/isl-2.json")).unlink()
     finalize(camp.dir)
     runs = pd.read_csv(camp.dir / "runs.csv")
     assert (runs.run_status == "partial").sum() == 1
-    tasks_df = pd.read_csv(camp.dir / "tasks.csv")
-    assert (tasks_df.task_status == "not_executed").sum() == 1
-    res = validate(camp.dir)
-    assert any(f["check"] == "partial_run" for f in res["findings"])
+    assert (pd.read_csv(camp.dir / "tasks.csv").task_status == "not_executed").sum() == 1
+    assert any(f["check"] == "partial_run" for f in validate(camp.dir)["findings"])
 
     # resume: only the missing trial reruns
-    camp2 = make_campaign(tmp_path, data_dir, tasks, {"condition": ["search_fetch"]}, campaign_id="resume", repeats=2)
+    camp2 = make_campaign(tmp_path, corpus_dir, {"condition": ["search_fetch"]}, campaign_id="resume", repeats=2)
     await camp2.run()
     finalize(camp2.dir)
-    assert set(pd.read_csv(camp2.dir / "runs.csv").run_status) == {"finished"}
-    assert validate(camp2.dir)["ok"]
-    # repeats share config_hash, have distinct run_ids
     runs = pd.read_csv(camp2.dir / "runs.csv")
-    assert runs.config_hash.nunique() == 1 and runs.run_id.nunique() == 2
+    assert set(runs.run_status) == {"finished"} and validate(camp2.dir)["ok"]
+    assert runs.config_hash.nunique() == 1 and runs.run_id.nunique() == 2  # repeats share config_hash
 
     # fault injection: each example-data fault class must be caught
     d = camp2.dir
@@ -193,32 +208,26 @@ async def test_resume_partial_and_fault_injection(setup):
     runs.loc[0, "price_catalog_version"] = None  # missing catalog
     runs.to_csv(d / "runs.csv", index=False)
     res = validate(d)
-    checks = {f["check"] for f in res["findings"]}
-    assert not res["ok"]
-    assert {"missing_metadata", "cost_rollup"} <= checks
+    assert not res["ok"] and {"missing_metadata", "cost_rollup"} <= {f["check"] for f in res["findings"]}
 
     # unverifiable run: passes recorded but call log removed
     finalize(d)
     calls = pd.read_csv(d / "model_calls.csv")
     run_with_pass = pd.read_csv(d / "runs.csv").query("tasks_passed > 0").run_id.iloc[0]
     calls[calls.run_id != run_with_pass].to_csv(d / "model_calls.csv", index=False)
-    checks = {f["check"] for f in validate(d)["findings"]}
-    assert {"unverifiable_run", "call_count_mismatch"} <= checks
+    assert {"unverifiable_run", "call_count_mismatch"} <= {f["check"] for f in validate(d)["findings"]}
 
 
 async def test_provider_failures_are_logged_as_infrastructure(setup):
-    tmp_path, data_dir, tasks = setup
-    camp = make_campaign(tmp_path, data_dir, tasks, {"condition": ["search_fetch"]}, campaign_id="infra")
+    tmp_path, corpus_dir = setup
+    camp = make_campaign(tmp_path, corpus_dir, {"condition": ["search_fetch"]}, campaign_id="infra")
     camp.client_factory = lambda p, m: MockClient(m, lambda msgs, tools: {"raise": "BadRequestError"})
     await camp.run()
     finalize(camp.dir)
     res = validate(camp.dir)
     assert any(f["check"] == "infrastructure_failure" for f in res["findings"])
     assert res["run_validity"][next(iter(res["run_validity"]))]["valid_perf"] is False
-    tasks_df = pd.read_csv(camp.dir / "tasks.csv")
-    assert (tasks_df.termination_reason == "exception").all()
-    calls = pd.read_csv(camp.dir / "model_calls.csv")
-    assert calls.exception_type.eq("BadRequestError").all()
-    # trajectory still has one step per (failed) call + closing
-    traj = json.loads(next((camp.work).glob("*/tasks/bcp-1.json")).read_text())["trajectory"]
-    assert len(traj["steps"]) == 2
+    assert (pd.read_csv(camp.dir / "tasks.csv").termination_reason == "exception").all()
+    assert pd.read_csv(camp.dir / "model_calls.csv").exception_type.eq("BadRequestError").all()
+    traj = json.loads(next(camp.work.glob("*/tasks/isl-1.json")).read_text())["trajectory"]
+    assert len(traj["steps"]) == 2  # one step per (failed) call + closing

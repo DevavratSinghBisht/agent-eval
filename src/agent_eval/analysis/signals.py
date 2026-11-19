@@ -17,13 +17,14 @@ def leak_check(work: dict[str, Any]) -> tuple[bool, str | None]:
     from ..tools.web import is_blocked
     from .evidence import normalize
 
-    q = normalize(work.get("question") or work["trajectory"].get("question", "")).split()
+    q = normalize(work.get("prompt") or work["trajectory"].get("prompt", "")).split()
     grams = {" ".join(q[i : i + LEAK_NGRAM]) for i in range(len(q) - LEAK_NGRAM + 1)}
+    patterns = work.get("leak_patterns") or []
     for s in work["trajectory"]["steps"]:
         for tc in s.get("tool_calls", []):
             raw = tc.get("tool_output_raw") or ""
             for url in URL_RE.findall(raw):
-                if is_blocked(url.rstrip(").,]")):
+                if is_blocked(url.rstrip(").,]"), patterns):
                     return True, f"blocked URL in {tc['tool']} output at step {s['step']}: {url[:120]}"
             if grams:
                 text = " " + normalize(raw) + " "
@@ -52,7 +53,7 @@ def trial_signals(work: dict[str, Any]) -> dict[str, Any]:
     read_more = sum(1 for c in calls if c["tool"] == "read_more")
     errors = sum(1 for c in calls if c["is_error"])
     events = Counter(e["kind"] for e in work["trajectory"].get("events", []))
-    exact = task.get("exact_answer") or ""
+    exact = str(task.get("answer") or "")
     conf = task.get("confidence")
     hedged = bool(exact) and (len(exact) > 80 or bool(HEDGE_RE.search(exact)))
     leak, leak_reason = leak_check(work)
@@ -75,5 +76,5 @@ def trial_signals(work: dict[str, Any]) -> dict[str, Any]:
         "hedged_answer": hedged,
         "overconfident_wrong": task.get("passed") is False and conf is not None and float(conf) >= 80,
         "premature_answer": task.get("termination_reason") == "final_answer" and len(research) == 0
-        and work.get("condition_id") != "closed_book",
+        and bool(work.get("toolset_tools")),
     }

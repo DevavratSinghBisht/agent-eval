@@ -1,6 +1,7 @@
 """agent-eval command line.
 
-  agent-eval prepare browsecomp|browsecomp_plus
+  agent-eval benchmarks | toolsets                 list registered benchmarks / toolsets and tools
+  agent-eval prepare <benchmark_id | experiment.yaml>
   agent-eval run <experiment.yaml> [--retry-errored] [--no-finalize]
   agent-eval finalize <campaign_dir>
   agent-eval validate <campaign_dir>
@@ -25,7 +26,9 @@ def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     ap = argparse.ArgumentParser(prog="agent-eval")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("prepare"); p.add_argument("benchmark"); p.add_argument("--data-dir", default="data")
+    sub.add_parser("benchmarks"); sub.add_parser("toolsets")
+    p = sub.add_parser("prepare"); p.add_argument("target", help="benchmark id, or an experiment YAML (for plugins with params)")
+    p.add_argument("--data-dir", default="data")
     p = sub.add_parser("run"); p.add_argument("experiment"); p.add_argument("--retry-errored", action="store_true")
     p.add_argument("--no-finalize", action="store_true")
     for name in ("finalize", "validate", "report"):
@@ -37,16 +40,30 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("compare"); p.add_argument("campaign_dir"); p.add_argument("a"); p.add_argument("b")
     args = ap.parse_args(argv)
 
+    if args.cmd == "benchmarks":
+        from .benchmarks import available
+
+        print("\n".join(available()))
+        print("(or any 'package.module:ClassName' subclass of agent_eval.benchmarks.Benchmark)")
+        return 0
+    if args.cmd == "toolsets":
+        from .tools import DEFAULT_TOOLSETS, available_tools
+
+        for name, tools in DEFAULT_TOOLSETS.items():
+            print(f"{name:16s} {', '.join(tools) or '(no tools)'}")
+        print("\nregistered tools:", ", ".join(available_tools()))
+        return 0
     if args.cmd == "prepare":
-        if args.benchmark == "browsecomp":
-            from .benchmarks.browsecomp import download
+        from .benchmarks import get_benchmark
+        from .core.config import BenchmarkConfig, load_experiment
 
-            print(download(args.data_dir))
-        elif args.benchmark == "browsecomp_plus":
-            from .benchmarks.browsecomp_plus import prepare
-
-            prepare(args.data_dir)
-            print("prepared", Path(args.data_dir) / "browsecomp_plus")
+        if args.target.endswith((".yaml", ".yml")):
+            cfg = load_experiment(args.target).benchmark
+        else:
+            cfg = BenchmarkConfig(id=args.target, data_dir=args.data_dir)
+        bench = get_benchmark(cfg)
+        bench.prepare()
+        print(f"prepared {bench.id}: {len(bench.load_tasks())} tasks")
         return 0
 
     if args.cmd == "run":

@@ -13,21 +13,13 @@ import itertools
 import json
 import subprocess
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import yaml
 from pydantic import BaseModel, Field
 
 from .. import __version__
 
-CONDITIONS = (
-    "closed_book",
-    "search_snippets",
-    "search_fetch",
-    "local_docs",
-    "search_docs",
-    "oracle_docs",
-)
 DELIVERY_POLICIES = (
     "full",
     "truncate_2k",
@@ -63,7 +55,10 @@ class GraderConfig(BaseModel):
 
 
 class BenchmarkConfig(BaseModel):
-    id: Literal["browsecomp", "browsecomp_plus"] = "browsecomp"
+    """`id` is a registered benchmark (see `agent-eval benchmarks`) or "package.module:ClassName"."""
+
+    id: str = "browsecomp"
+    params: dict[str, Any] = Field(default_factory=dict)  # plugin-specific settings
     num_examples: int | None = None
     seed: int = 0
     task_ids: list[str] | None = None
@@ -76,9 +71,10 @@ class RunConfig(BaseModel):
     benchmark: BenchmarkConfig
     model: ModelConfig
     harness: str = "direct_tool"
-    condition: str = "search_fetch"
+    condition: str = "search_fetch"          # name of a toolset (see tools.DEFAULT_TOOLSETS)
+    toolset_tools: list[str] | None = None   # resolved tool list for `condition` (part of the hash)
     delivery: str = "full"
-    search_backend: str = "tavily"
+    search_backend: str = "exa"
     search_max_results: int = 5
     context_policy: str = "none"
     summarizer_model: str = "claude-haiku-5-5"
@@ -94,6 +90,7 @@ class ExperimentConfig(BaseModel):
     description: str = ""
     benchmark: BenchmarkConfig = Field(default_factory=BenchmarkConfig)
     grader: GraderConfig = Field(default_factory=GraderConfig)
+    toolsets: dict[str, list[str]] = Field(default_factory=dict)  # extra/overriding named toolsets
     defaults: dict[str, Any] = Field(default_factory=dict)
     matrix: dict[str, list[Any]] = Field(default_factory=dict)
     repeats: int = 1
@@ -112,8 +109,6 @@ class ExperimentConfig(BaseModel):
                 _set_dotted(merged, k, v)
             merged["benchmark"] = self.benchmark.model_dump()
             rc = RunConfig.model_validate(merged)
-            if rc.condition not in CONDITIONS:
-                raise ValueError(f"unknown condition {rc.condition!r}; choose from {CONDITIONS}")
             if rc.delivery not in DELIVERY_POLICIES:
                 raise ValueError(f"unknown delivery {rc.delivery!r}; choose from {DELIVERY_POLICIES}")
             out.append(rc)

@@ -1,6 +1,9 @@
 """Campaign runner: expand the experiment matrix into runs, execute (run, task) trials with
 bounded concurrency, write one atomic work record per trial, and support resume.
 
+Benchmark-neutral: the benchmark plugin supplies tasks, prompts, the answer tool, toolsets,
+corpus and grading; the runner owns the agent loop, budgets, logging and bookkeeping.
+
 Work layout (consolidated into CSVs/archives by `finalize`):
   runs/<campaign>/_work/<run_id>/run.json
   runs/<campaign>/_work/<run_id>/tasks/<task_id>.json
@@ -23,18 +26,17 @@ from rich.console import Console
 
 from ..agent import prompts
 from ..agent.react import ReactAgent
-from ..benchmarks import Task, load_tasks
-from ..benchmarks.browsecomp import parse_response_confidence
+from ..benchmarks import Benchmark, Task, get_benchmark
 from ..core.config import ExperimentConfig, RunConfig, runner_version
 from ..core.pricing import PriceCatalog, load_catalog
+from ..core.task import GradeResult
 from ..core.types import Message
+from ..graders import Judge
 from ..providers import CallOptions, ModelClient, make_client
-from ..tools import build_tools
+from ..tools import ToolBuildContext, build_tools, resolve_toolsets
 from ..tools.base import ToolContext, ToolRuntime
 from ..tools.delivery import make_policy
-from ..tools.final_answer import format_response
 from ..tracing.recorder import TaskRecorder
-from .grading import Grader
 
 console = Console()
 
@@ -46,9 +48,13 @@ class RunSpec:
     cfg: RunConfig
 
 
-def plan_runs(exp: ExperimentConfig) -> list[RunSpec]:
+def plan_runs(exp: ExperimentConfig, toolsets: dict[str, list[str]]) -> list[RunSpec]:
+    """Resolve each run's toolset (so its tool list is part of config_hash) and assign run ids."""
     specs = []
     for rc in exp.expand():
+        if rc.condition not in toolsets:
+            raise ValueError(f"unknown condition/toolset {rc.condition!r}; available: {sorted(toolsets)}")
+        rc = rc.model_copy(update={"toolset_tools": list(toolsets[rc.condition])})
         h = rc.config_hash()
         for k in range(exp.repeats):
             specs.append(RunSpec(f"run_{h}_rep{k}", k, rc))
@@ -62,14 +68,18 @@ def atomic_write(path: Path, data: bytes) -> None:
     os.replace(tmp, path)
 
 
+def _scalar(v: Any) -> Any:
+    return v if v is None or isinstance(v, (str, int, float, bool)) else json.dumps(v, ensure_ascii=False, default=str)
+
+
 class Campaign:
     def __init__(
         self,
         exp: ExperimentConfig,
         root: str | Path | None = None,
         client_factory: Callable[[str, str], ModelClient] = make_client,
-        grader: Grader | None = None,
-        tasks: list[Task] | None = None,
+        benchmark: Benchmark | None = None,
+        judge: Judge | None = None,
     ):
         self.exp = exp
         self.dir = Path(root or exp.output_dir) / exp.campaign_id
@@ -77,9 +87,12 @@ class Campaign:
         self.catalog: PriceCatalog = load_catalog(exp.price_catalog)
         self.runner_version = runner_version()
         self.client_factory = client_factory
-        self.grader = grader or Grader(exp.grader, self.catalog, client_factory(exp.grader.provider, exp.grader.model))
-        self.tasks = tasks if tasks is not None else load_tasks(exp.benchmark)
-        self.specs = plan_runs(exp)
+        self.benchmark = benchmark or get_benchmark(exp.benchmark)
+        g = exp.grader
+        self.judge = judge or Judge(client_factory(g.provider, g.model), g.model, self.catalog, g.effort, g.max_tokens)
+        self.tasks = self.benchmark.tasks()
+        self.toolsets = resolve_toolsets(self.benchmark.toolsets(), exp.toolsets)
+        self.specs = plan_runs(exp, self.toolsets)
         self.spent = 0.0
         self._lock = asyncio.Lock()
         self.stop_reason: str | None = None
@@ -97,11 +110,12 @@ class Campaign:
         meta = {
             "run_id": spec.run_id,
             "campaign_id": self.exp.campaign_id,
-            "benchmark_id": spec.cfg.benchmark.id,
+            "benchmark_id": self.benchmark.id,
             "model_name": spec.cfg.model.name,
             "provider": spec.cfg.model.provider,
             "harness_name": spec.cfg.harness,
             "condition_id": spec.cfg.condition,
+            "toolset_tools": ",".join(spec.cfg.toolset_tools or []),
             "delivery_policy": spec.cfg.delivery,
             "effort": spec.cfg.model.effort,
             "search_backend": spec.cfg.search_backend,
@@ -114,7 +128,7 @@ class Campaign:
             "runner_versions": rv,
             "price_catalog_version": self.catalog.version,
             "seed": spec.cfg.benchmark.seed,
-            "grader_model": self.exp.grader.model,
+            "grader_model": self.judge.model,
             "config": spec.cfg.model_dump(mode="json"),
             "task_ids": [t.task_id for t in self.tasks],
             "started_at": prior.get("started_at", time.time()),
@@ -138,7 +152,7 @@ class Campaign:
         ]
         done = len(self.specs) * len(self.tasks) - len(todo)
         console.print(
-            f"[bold]{self.exp.campaign_id}[/]: {len(self.specs)} runs x {len(self.tasks)} tasks; "
+            f"[bold]{self.exp.campaign_id}[/] ({self.benchmark.id}): {len(self.specs)} runs x {len(self.tasks)} tasks; "
             f"{done} already done, {len(todo)} to run (concurrency {self.exp.concurrency}, "
             f"campaign cap ${self.exp.max_cost_usd:.2f})"
         )
@@ -157,23 +171,22 @@ class Campaign:
         await asyncio.gather(*(worker(s, t) for s, t in todo))
 
     async def run_trial(self, spec: RunSpec, task: Task) -> dict[str, Any]:
-        cfg = spec.cfg
+        cfg, bench = spec.cfg, self.benchmark
         rec = TaskRecorder(spec.run_id, task.task_id, cfg.model.name, self.catalog)
         status, error = "completed", None
         outcome = None
         try:
             client = self.client_factory(cfg.model.provider, cfg.model.name)
             delivery = make_policy(cfg.delivery)
-            oracle = None
-            if cfg.condition == "oracle_docs":
-                oracle = list(dict.fromkeys(task.metadata.get("evidence_docids", []) + task.metadata.get("gold_docids", [])))
-            ctx = ToolContext(question=task.question, task_id=task.task_id)
+            ctx = ToolContext(prompt=task.prompt, task_id=task.task_id)
             if cfg.delivery == "summarize":
                 ctx.summarize = self._make_summarizer(cfg)
-            tools = build_tools(
-                cfg.condition, delivery, self.catalog, cfg.search_backend, cfg.search_max_results,
-                cfg.benchmark.data_dir, set(oracle) if oracle else None,
+            build_ctx = ToolBuildContext(
+                catalog=self.catalog, search_backend=cfg.search_backend, search_k=cfg.search_max_results,
+                corpus_dir=bench.corpus_dir(), oracle_doc_ids=bench.oracle_doc_ids(task),
+                blocklist=list(bench.leak_patterns),
             )
+            tools = build_tools(cfg.toolset_tools or [], build_ctx, delivery, bench.answer_tool())
             runtime = ToolRuntime(tools, delivery, ctx)
             options = CallOptions(
                 max_tokens=cfg.model.max_tokens, effort=cfg.model.effort,
@@ -181,32 +194,30 @@ class Campaign:
             )
             agent = ReactAgent(client, options, cfg.limits)
             outcome = await agent.run(
-                prompts.system_prompt(cfg.condition, cfg.delivery),
-                prompts.task_prompt(task.question, oracle),
-                runtime,
-                rec,
+                bench.system_prompt(cfg.condition, cfg.delivery), bench.task_prompt(task, cfg.condition), runtime, rec,
             )
         except Exception as e:  # harness bug or setup failure: the trial is logged as errored
             status, error = "errored", f"{type(e).__name__}: {e}"
             rec.errors.append(traceback.format_exc()[-2000:])
             rec.exception_count += 1
 
-        response = format_response(outcome.final_answer if outcome else None, outcome.fallback_text if outcome else "")
-        grade: dict[str, Any] = {}
+        answer = outcome.final_answer if outcome else None
+        response = bench.format_response(answer, outcome.fallback_text if outcome else "")
+        grade = GradeResult(None)
         if status == "completed":
-            grade = await self.grader.grade(task.question, task.answer, response)
-            if grade["verdict"] is None:
+            try:
+                grade = await bench.grade(task, response, answer, self.judge)
+            except Exception as e:  # a grader bug must not lose the trial
+                grade = GradeResult(None, error=f"{type(e).__name__}: {e}")
+            if grade.passed is None:
                 status = "grading_error"
-        fa = outcome.final_answer if outcome else None
-        conf = (fa or {}).get("confidence")
-        if conf is None:
-            conf = parse_response_confidence(response)
         task_row = {
             "run_id": spec.run_id,
             "task_id": task.task_id,
-            "topic": task.metadata.get("topic"),
+            **{f"meta_{k}": _scalar(v) for k, v in task.metadata.items()},
             "task_status": status,
-            "passed": (grade.get("verdict") == "yes") if grade.get("verdict") else None,
+            "passed": grade.passed,
+            "score": grade.score,
             "exception_count": rec.exception_count,
             "error": error or ("; ".join(rec.errors)[:1000] if rec.errors else None),
             "call_count": len(rec.model_calls),
@@ -221,33 +232,35 @@ class Campaign:
             "latency_seconds": round(rec.elapsed, 3),
             "final_phase": outcome.final_phase if outcome else None,
             "termination_reason": outcome.termination_reason if outcome else "exception",
-            "exact_answer": (fa or {}).get("exact_answer"),
-            "confidence": conf,
+            "answer": _scalar((answer or {}).get("answer")),
+            "confidence": bench.confidence(answer),
             "response": response,
-            "correct_answer": task.answer,
-            "grader_verdict": grade.get("verdict"),
-            "grader_extracted_answer": grade.get("extracted_final_answer"),
-            "grader_parse_ok": grade.get("parse_ok"),
-            "grader_model": grade.get("grader_model"),
-            "grader_cost_usd": grade.get("grader_cost_usd", 0.0),
-            "grader_raw": grade.get("grader_raw"),
-            "grader_error": grade.get("grader_error"),
+            "reference": _scalar(task.reference),
+            "grader_model": grade.grader_model,
+            "grader_cost_usd": round(grade.cost_usd, 6),
+            "grader_error": grade.error,
+            **{f"grade_{k}": _scalar(v) for k, v in grade.details.items()},
             "finished_at": time.time(),
         }
         closing = {
-            "final_answer": fa,
+            "final_answer": answer,
             "response": response,
             "termination_reason": task_row["termination_reason"],
-            "passed": task_row["passed"],
-            "grader_verdict": task_row["grader_verdict"],
+            "passed": grade.passed,
+            "score": grade.score,
         }
         work = rec.close(closing)
         raw_api = work.pop("raw_api")
-        work["task"] = task_row
-        work["task_metadata"] = task.metadata
-        work["question"] = task.question
-        work["trajectory"]["question"] = task.question
-        work["trajectory"]["correct_answer"] = task.answer
+        work.update({
+            "task": task_row,
+            "task_metadata": task.metadata,
+            "prompt": task.prompt,
+            "evidence": {"answer_strings": task.evidence.answer_strings, "doc_ids": task.evidence.doc_ids},
+            "leak_patterns": list(bench.leak_patterns),
+            "toolset_tools": cfg.toolset_tools or [],
+        })
+        work["trajectory"].update({"prompt": task.prompt, "reference": _scalar(task.reference),
+                                   "evidence_strings": task.evidence.answer_strings})
         cctx = zstandard.ZstdCompressor(level=6)
         atomic_write(
             self.work / spec.run_id / "raw_api" / f"{task.task_id}.jsonl.zst",
@@ -255,8 +268,8 @@ class Campaign:
         )
         atomic_write(self.task_path(spec.run_id, task.task_id), json.dumps(work, default=str).encode())
         async with self._lock:
-            self.spent += rec.cost + task_row["grader_cost_usd"]
-        mark = {True: "[green]PASS[/]", False: "[red]fail[/]", None: "[yellow]n/a[/]"}[task_row["passed"]]
+            self.spent += rec.cost + grade.cost_usd
+        mark = {True: "[green]PASS[/]", False: "[red]fail[/]", None: "[yellow]n/a[/]"}[grade.passed]
         console.print(
             f"{mark} {spec.run_id} {task.task_id} {cfg.condition}/{cfg.delivery} "
             f"steps={task_row['call_count']} term={task_row['termination_reason']} "
@@ -267,10 +280,10 @@ class Campaign:
     def _make_summarizer(self, cfg: RunConfig):
         client = self.client_factory(cfg.model.provider, cfg.summarizer_model)
 
-        async def summarize(text: str, question: str):
+        async def summarize(text: str, prompt: str):
             turn, _ = await client.complete(
                 "",
-                [Message("user", text=prompts.SUMMARIZER_PROMPT.format(question=question, text=text))],
+                [Message("user", text=prompts.SUMMARIZER_PROMPT.format(question=prompt, text=text))],
                 [],
                 CallOptions(max_tokens=4000, effort="low"),
             )

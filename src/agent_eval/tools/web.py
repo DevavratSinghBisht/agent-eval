@@ -1,7 +1,8 @@
 """Client-side web search + fetch tools (identical for every model provider).
 
-Search backends are pluggable (Tavily, Exa, mock). All results and fetches pass through a
-leak blocklist so pages that republish BrowseComp questions/answers are never returned.
+Search backends are pluggable (Tavily, Exa, mock). All results and fetches pass through a leak
+blocklist: generic dataset-mirror rules plus the running benchmark's own `leak_patterns`, so pages
+that republish benchmark questions/answers are never returned.
 """
 
 from __future__ import annotations
@@ -17,21 +18,12 @@ import httpx
 from ..core.types import ToolSpec
 from .base import RawToolOutput, Tool, schema
 
-# Hosts/paths known to mirror benchmark data. Extend via AGENT_EVAL_BLOCKLIST (comma-separated).
+# Generic dataset mirrors. Benchmark-specific patterns come from Benchmark.leak_patterns;
+# extra ones via AGENT_EVAL_BLOCKLIST (comma-separated).
 DEFAULT_BLOCKLIST = [
     "huggingface.co/datasets",
-    "github.com/openai/simple-evals",
-    "openaipublic.blob.core.windows.net",
-    "browsecomp",
-    "browse_comp",
-    "browse-comp",
-    "bcplus",
-    "bc_plus",
-    "bc-plus",
-    "simple-evals",
-    "simple_evals",
-    "kaggle.com/datasets",
     "datasets-server.huggingface.co",
+    "kaggle.com/datasets",
 ]
 
 SEARCH_RETRIES = 3  # retries on 429/5xx/network errors (backoff 2, 4, 8 s or Retry-After)
@@ -56,9 +48,9 @@ def is_dataset_file(url: str) -> bool:
     return any(p.netloc == h or p.netloc.endswith("." + h) for h in CODE_HOSTS) and bool(DATA_FILE_RE.search(p.path))
 
 
-def is_blocked(url: str) -> bool:
+def is_blocked(url: str, extra: list[str] | tuple[str, ...] = ()) -> bool:
     u = url.lower()
-    return any(b in u for b in blocklist()) or is_dataset_file(u)
+    return any(b in u for b in blocklist()) or any(b.lower() in u for b in extra) or is_dataset_file(u)
 
 
 # ---- search backends ------------------------------------------------------------------
@@ -136,8 +128,10 @@ def make_backend(name: str) -> SearchBackend:
 
 # ---- tools ----------------------------------------------------------------------------
 class WebSearchTool(Tool):
-    def __init__(self, backend: SearchBackend, cost_per_call: float, k: int = 5, snippets_only: bool = False):
+    def __init__(self, backend: SearchBackend, cost_per_call: float, k: int = 5, snippets_only: bool = False,
+                 blocklist: list[str] | None = None):
         self.backend, self.cost, self.k = backend, cost_per_call, k
+        self.extra_block = list(blocklist or [])
         desc = (
             "Search the web. Returns up to {k} results, each with title, URL and a short snippet. "
             "Write specific queries (names, dates, distinctive phrases); reformulate rather than "
@@ -187,8 +181,8 @@ class WebSearchTool(Tool):
                     is_error=True, error_type=f"Search{type(e).__name__}", deliverable=False,
                     meta={"query": q, "attempts": attempts},
                 )
-        kept = [r for r in results if not is_blocked(r["url"])][: self.k]
-        blocked = sum(1 for r in results if is_blocked(r["url"]))
+        kept = [r for r in results if not is_blocked(r["url"], self.extra_block)][: self.k]
+        blocked = sum(1 for r in results if is_blocked(r["url"], self.extra_block))
         if not kept:
             text = f"No results for: {q}"
         else:
@@ -209,11 +203,14 @@ class WebFetchTool(Tool):
         parameters=schema({"url": {"type": "string", "description": "Absolute http(s) URL."}}),
     )
 
+    def __init__(self, blocklist: list[str] | None = None):
+        self.extra_block = list(blocklist or [])
+
     async def run(self, args, ctx):
         url = (args.get("url") or "").strip()
         if not re.match(r"^https?://", url):
             return RawToolOutput("Error: url must start with http:// or https://", is_error=True, error_type="BadArgs", deliverable=False)
-        if is_blocked(url):
+        if is_blocked(url, self.extra_block):
             return RawToolOutput("Error: this URL is blocked in this evaluation.", is_error=True, error_type="Blocked", deliverable=False)
         mock = MockBackend.pages.get(url)
         if mock is not None:

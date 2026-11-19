@@ -119,6 +119,7 @@ def score_configs(runs: pd.DataFrame, tasks: pd.DataFrame, validity: dict | None
                 "n_tasks": len(per_task),
                 "n_leak_excluded": int(n_leak.get(row["config_hash"], 0)) if n_leak is not None else 0,
                 "accuracy": float(means.mean()) if len(means) else float("nan"),
+                "mean_score": float(g.score.mean()) if "score" in g and g.score.notna().any() else float("nan"),
                 "ci_lo": lo,
                 "ci_hi": hi,
             }

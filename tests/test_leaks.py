@@ -10,13 +10,15 @@ def test_blocklist_catches_dataset_dumps():
     assert is_blocked("https://github.com/someone/repo/blob/main/data/questions.jsonl")    # unnamed dump
     assert is_blocked("https://raw.githubusercontent.com/x/y/main/test.parquet")
     assert is_blocked("https://huggingface.co/datasets/Tevatron/browsecomp-plus")
+    assert not is_blocked("https://example.org/browsecomp-answers")                    # benchmark-specific: not by default
+    assert is_blocked("https://example.org/browsecomp-answers", ["browsecomp"])       # ...only with that benchmark's patterns
     assert not is_blocked("https://github.com/someone/repo")                                 # ordinary repo page
     assert not is_blocked("https://en.wikipedia.org/wiki/Aziz_Maraka")
     assert not is_blocked("https://bvb.ro/info/Raportari/AST/report.pdf")
 
 
 def _work(output: str) -> dict:
-    return {"question": QUESTION, "trajectory": {"steps": [
+    return {"prompt": QUESTION, "trajectory": {"steps": [
         {"step": 0, "tool_calls": [{"tool": "web_search", "tool_output_raw": output}]}]}}
 
 
@@ -56,4 +58,4 @@ def test_search_retries_rate_limits_and_records_status():
 
 def test_malformed_urls_do_not_crash():
     assert not is_blocked("http://[not-an-ipv6/page")
-    assert is_blocked("http://[weird/browsecomp/dump")  # substring rules still apply
+    assert is_blocked("http://[weird/browsecomp/dump", ["browsecomp"])  # substring rules still apply

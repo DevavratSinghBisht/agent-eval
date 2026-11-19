@@ -5,11 +5,11 @@ model was actually shown (delivered, after the delivery policy), and in what the
 afterwards (reasoning, text, tool inputs, final answer). Each failure is attributed to the
 first broken link.
 
-Evidence definitions:
-  * answer-string evidence (all BrowseComp tasks): normalized gold answer appears in the text
-  * gold-doc evidence (BrowseComp-Plus): a gold/evidence docid appears in the tool output's docids
-    (search results count as "retrieved"; read_doc of that docid counts as "delivered" if the
-    answer string or a large part of the doc survived delivery)
+Evidence comes from the benchmark's `Task.evidence`:
+  * answer_strings: normalized strings (gold answer, aliases, key facts) appearing in the text
+  * doc_ids: ids of corpus documents containing the evidence, matched against each tool output's
+    docids (search hits count as "retrieved"; a read_* of that doc counts as "delivered")
+Tasks without any evidence are reported as `unattributed_failure` when they fail.
 """
 
 from __future__ import annotations
@@ -55,10 +55,10 @@ def contains_answer(text: str, variants: list[str]) -> bool:
 def analyze_trial(work: dict[str, Any]) -> dict[str, Any]:
     """Returns task-level funnel fields and per-tool-call evidence flags."""
     task = work["task"]
-    answer = task.get("correct_answer") or ""
-    variants = answer_variants(answer)
-    meta = work.get("task_metadata") or {}
-    gold_docs = set(meta.get("gold_docids") or []) | set(meta.get("evidence_docids") or [])
+    ev = work.get("evidence") or {}
+    variants = sorted({v for s in ev.get("answer_strings") or [] for v in answer_variants(str(s))})
+    gold_docs = set(ev.get("doc_ids") or [])
+    has_evidence = bool(variants or gold_docs)
     steps = [s for s in work["trajectory"]["steps"] if not s.get("closing")]
 
     per_call: dict[str, dict[str, Any]] = {}
@@ -75,16 +75,18 @@ def analyze_trial(work: dict[str, Any]) -> dict[str, Any]:
             gold_in = bool(docids & gold_docs)
             if gold_in:
                 gold_doc_retrieved = True
-                if tc["tool"] == "read_doc":
+                if tc["tool"].startswith("read"):
                     gold_doc_read = True
             per_call[tc["call_id"]] = {
                 "answer_in_raw": raw_hit,
                 "answer_in_delivered": del_hit,
                 "gold_doc_in_output": gold_in,
             }
-            if raw_hit and first_retrieved is None:
+            # with answer strings, the funnel tracks the strings (gold docs are reported separately in
+            # gold_doc_retrieved/read); without them, gold documents are the evidence
+            if (raw_hit or (gold_in and not variants)) and first_retrieved is None:
                 first_retrieved = s["step"]
-            if del_hit and first_delivered is None:
+            if (del_hit or (gold_in and not variants and not tc.get("delivery_meta", {}).get("truncated"))) and first_delivered is None:
                 first_delivered = s["step"]
 
     attended = False
@@ -98,20 +100,22 @@ def analyze_trial(work: dict[str, Any]) -> dict[str, Any]:
             if any(contains_answer(t, variants) for t in texts):
                 attended = True
                 break
-    final_has_answer = contains_answer(task.get("exact_answer") or "", variants)
+    final_has_answer = contains_answer(str(task.get("answer") or ""), variants)
     if first_delivered is not None and final_has_answer:
         attended = True
 
     passed = task.get("passed")
-    condition = work.get("condition_id")
+    no_tools = not work.get("toolset_tools")
     if task.get("task_status") != "completed":
         category = "harness_error" if task.get("task_status") == "errored" else "grading_error"
     elif passed:
         category = "success"
     elif task.get("termination_reason") not in ("final_answer",):
         category = f"no_answer_{task.get('termination_reason')}"
-    elif condition == "closed_book":
-        category = "knowledge_miss"
+    elif no_tools:
+        category = "knowledge_miss"  # failed with no research tools available
+    elif not has_evidence:
+        category = "unattributed_failure"  # benchmark defines no evidence, so the funnel cannot attribute
     elif first_retrieved is None:
         category = "retrieval_miss"
     elif first_delivered is None:

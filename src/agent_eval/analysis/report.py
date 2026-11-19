@@ -62,7 +62,7 @@ def build_report(campaign_dir: str | Path) -> Path:
     parts.append(
         "Categories: success; retrieval_miss (answer never in any tool output); truncation_loss (in raw output but cut "
         "by the delivery policy); comprehension_miss (shown to the model but never used); synthesis_error (used but final "
-        "answer wrong); knowledge_miss (closed-book); no_answer_* (cap/refusal/exception); format_or_grading.\n\n"
+        "answer wrong); knowledge_miss (no research tools); unattributed_failure (benchmark defines no evidence); no_answer_* (cap/refusal/exception); format_or_grading.\n\n"
     )
     parts.append(md_table(funnel_table(tasks, runs)))
     parts.append("\n## Tool-result consumption (raw vs delivered)\n")

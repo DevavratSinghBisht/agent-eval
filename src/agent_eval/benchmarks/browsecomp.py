@@ -1,4 +1,5 @@
-"""BrowseComp (OpenAI, 2025) — faithful port of openai/simple-evals `browsecomp_eval.py`.
+"""BrowseComp (OpenAI, 2025) — reference benchmark plugin; faithful port of openai/simple-evals
+`browsecomp_eval.py`.
 
 Differences from the reference implementation (both are bug fixes, documented on purpose):
   1. simple-evals returns `match.group(0)` ("correct: yes") and compares it to "yes", so
@@ -10,14 +11,16 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import random
 import re
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pandas as pd
+
+from ..core.task import Evidence, GradeResult, Task
+from ..graders import Judge, TemplateJudge
+from .base import Benchmark, register
 
 CSV_URL = "https://openaipublic.blob.core.windows.net/simple-evals/browse_comp_test_set.csv"
 
@@ -52,13 +55,23 @@ correct: Answer 'yes' if extracted_final_answer matches the [correct_answer] giv
 confidence: The extracted confidence score between 0|\\%| and 100|\\%| from [response]. Put 100 if there is no confidence score available.
 """.strip()
 
+GRADE_RE = re.compile(r"correct:\s*\**\s*(yes|no)", re.IGNORECASE)
+EXTRACT_RE = re.compile(r"extracted_final_answer:\s*(.*)", re.IGNORECASE)
+CONF_RE = re.compile(r"confidence:\s*\**\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
 
-@dataclass
-class Task:
-    task_id: str
-    question: str
-    answer: str
-    metadata: dict[str, Any] = field(default_factory=dict)
+RESEARCH_SYSTEM_PROMPT = """You are a meticulous research agent answering hard, fact-seeking questions that have a single short answer.
+
+How to work:
+- The question lists several constraints. Find a candidate that satisfies ALL of them, and verify each constraint against a source before you answer.
+- Prefer primary and authoritative sources. Do not trust a single snippet for a critical fact.
+- Before each tool call, briefly state what you are looking for and why.
+- If a line of search is not working, change strategy (different entity, different constraint, different phrasing) instead of repeating it.
+- You have a limited budget of steps. When you are told the budget is nearly used up, stop searching and answer.
+
+Finishing:
+- End by calling the final_answer tool exactly once with a brief explanation, ONE exact answer, and an honest confidence (0-100).
+- Never list multiple alternative answers. If you are unsure, give your single best guess with a low confidence.
+"""
 
 
 def derive_key(password: str, length: int) -> bytes:
@@ -78,53 +91,6 @@ def encrypt(plaintext: str, password: str) -> str:
     return base64.b64encode(bytes(a ^ b for a, b in zip(data, key))).decode()
 
 
-def csv_path(data_dir: str | Path) -> Path:
-    return Path(data_dir) / "browsecomp" / "browse_comp_test_set.csv"
-
-
-def download(data_dir: str | Path) -> Path:
-    p = csv_path(data_dir)
-    if not p.exists():
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with httpx.Client(timeout=120, follow_redirects=True) as c:
-            r = c.get(CSV_URL)
-            r.raise_for_status()
-            p.write_bytes(r.content)
-    return p
-
-
-def load_tasks(
-    data_dir: str | Path,
-    num_examples: int | None = None,
-    seed: int = 0,
-    task_ids: list[str] | None = None,
-) -> list[Task]:
-    df = pd.read_csv(download(data_dir))
-    tasks = []
-    for i, row in enumerate(df.to_dict("records")):
-        canary = row.get("canary", "")
-        tasks.append(
-            Task(
-                task_id=f"bc-{i:04d}",
-                question=decrypt(row.get("problem", ""), canary),
-                answer=decrypt(row.get("answer", ""), canary),
-                metadata={"topic": row.get("problem_topic")},
-            )
-        )
-    if task_ids:
-        wanted = set(task_ids)
-        return [t for t in tasks if t.task_id in wanted]
-    if num_examples:
-        # same sampling as simple-evals (random.Random(0).sample) when seed == 0
-        tasks = random.Random(seed).sample(tasks, num_examples)
-    return tasks
-
-
-GRADE_RE = re.compile(r"correct:\s*\**\s*(yes|no)", re.IGNORECASE)
-EXTRACT_RE = re.compile(r"extracted_final_answer:\s*(.*)", re.IGNORECASE)
-CONF_RE = re.compile(r"confidence:\s*\**\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
-
-
 def parse_grade(text: str) -> dict[str, Any]:
     m = GRADE_RE.search(text)
     e = EXTRACT_RE.search(text)
@@ -137,9 +103,69 @@ def parse_grade(text: str) -> dict[str, Any]:
     }
 
 
-RESPONSE_CONF_RE = re.compile(r"Confidence:\s*(\d+(?:\.\d+)?)\s*%?", re.IGNORECASE)
+@register("browsecomp")
+class BrowseComp(Benchmark):
+    """1,266 encrypted fact-seeking questions; live-web browsing; LLM judge vs the gold answer."""
 
+    leak_patterns = [
+        "browsecomp", "browse_comp", "browse-comp", "bcplus", "bc_plus", "bc-plus",
+        "simple-evals", "simple_evals", "github.com/openai/simple-evals", "openaipublic.blob.core.windows.net",
+    ]
+    judge_template = TemplateJudge(
+        template=GRADER_TEMPLATE,
+        verdict_re=GRADE_RE.pattern,
+        extract={"extracted_final_answer": EXTRACT_RE.pattern, "grader_confidence": CONF_RE.pattern},
+    )
 
-def parse_response_confidence(response: str) -> float | None:
-    m = RESPONSE_CONF_RE.search(response)
-    return min(100.0, float(m.group(1))) if m else None
+    # ---- data ----------------------------------------------------------------------------
+    def csv_path(self) -> Path:
+        return self.data_dir / "browsecomp" / "browse_comp_test_set.csv"
+
+    def prepare(self) -> None:
+        p = self.csv_path()
+        if not p.exists():
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with httpx.Client(timeout=120, follow_redirects=True) as c:
+                r = c.get(CSV_URL)
+                r.raise_for_status()
+                p.write_bytes(r.content)
+
+    def load_tasks(self) -> list[Task]:
+        self.prepare()
+        df = pd.read_csv(self.csv_path())
+        tasks = []
+        for i, row in enumerate(df.to_dict("records")):
+            canary = row.get("canary", "")
+            answer = decrypt(row.get("answer", ""), canary)
+            tasks.append(
+                Task(
+                    task_id=f"bc-{i:04d}",
+                    prompt=decrypt(row.get("problem", ""), canary),
+                    reference=answer,
+                    metadata={"topic": row.get("problem_topic")},
+                    evidence=Evidence(answer_strings=[answer]),
+                )
+            )
+        return tasks
+
+    # ---- agent-facing --------------------------------------------------------------------
+    def base_prompt(self) -> str:
+        return RESEARCH_SYSTEM_PROMPT
+
+    def task_prompt(self, task: Task, condition: str) -> str:
+        return "Question:\n" + super().task_prompt(task, condition).removeprefix("Task:\n")
+
+    # ---- grading -------------------------------------------------------------------------
+    def format_response(self, answer: dict | None, fallback_text: str = "") -> str:
+        """The official Explanation / Exact Answer / Confidence response format."""
+        if not answer:
+            return fallback_text or "Explanation: None\nExact Answer: None\nConfidence: 0%"
+        conf = answer.get("confidence")
+        return (
+            f"Explanation: {answer.get('explanation', '')}\n"
+            f"Exact Answer: {answer.get('answer', '')}\n"
+            f"Confidence: {conf if conf is not None else 100}%"
+        )
+
+    async def grade(self, task: Task, response: str, answer: dict | None, judge: Judge) -> GradeResult:
+        return await self.judge_template(judge, question=task.prompt, correct_answer=task.reference, response=response)

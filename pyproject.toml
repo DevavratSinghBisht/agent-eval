@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agent-eval"
 version = "0.1.0"
-description = "Tool-calling agent evaluation harness with full-fidelity logging and failure analysis (BrowseComp first)."
+description = "Benchmark-neutral tool-calling agent evaluation harness with full-fidelity logging and failure analysis."
 requires-python = ">=3.11"
 dependencies = [
     "anthropic>=2.0",

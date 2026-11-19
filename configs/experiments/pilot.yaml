@@ -1,3 +1,4 @@
+# Benchmark: BrowseComp reference plugin (see docs/ADDING_A_BENCHMARK.md for your own).
 # Pilot: 13 BrowseComp questions (1%) under two conditions (~$10 cap). Run before any larger campaign
 # and read every trajectory: `agent-eval trajectory runs/pilot <run_id> <task_id> --html t.html`
 campaign_id: pilot

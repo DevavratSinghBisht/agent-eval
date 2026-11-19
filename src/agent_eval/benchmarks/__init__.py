@@ -1,17 +1,7 @@
-from __future__ import annotations
+"""Benchmark plugins. Built-ins: browsecomp, browsecomp_plus (reference implementations) and
+jsonl_qa (bring-your-own JSONL dataset). Add new ones from `_template.py`."""
 
-from ..core.config import BenchmarkConfig
-from .browsecomp import Task
+from ..core.task import Evidence, GradeResult, Task
+from .base import Benchmark, available, get_benchmark, register
 
-
-def load_tasks(cfg: BenchmarkConfig) -> list[Task]:
-    if cfg.id == "browsecomp":
-        from .browsecomp import load_tasks as f
-    elif cfg.id == "browsecomp_plus":
-        from .browsecomp_plus import load_tasks as f
-    else:
-        raise ValueError(f"unknown benchmark {cfg.id}")
-    return f(cfg.data_dir, cfg.num_examples, cfg.seed, cfg.task_ids)
-
-
-__all__ = ["Task", "load_tasks"]
+__all__ = ["Benchmark", "Evidence", "GradeResult", "Task", "available", "get_benchmark", "register"]

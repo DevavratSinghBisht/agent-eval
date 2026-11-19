@@ -1,0 +1,16 @@
+# Tool-access ablation on the SAME BrowseComp-Plus questions (paired comparisons).
+# Requires `agent-eval prepare browsecomp_plus` (downloads ~3 GB + builds a BM25 index).
+campaign_id: ablation_tools
+benchmark: {id: browsecomp_plus, num_examples: 8, seed: 0}
+grader: {provider: anthropic, model: claude-haiku-5-5, effort: low}
+repeats: 3
+concurrency: 24
+max_cost_usd: 100.0
+defaults:
+  model: {provider: anthropic, name: claude-haiku-5-5, effort: medium, max_tokens: 16000, thinking_display: summarized}
+  harness: direct_tool
+  delivery: full
+  search_backend: exa
+  limits: {step_cap: 50, token_budget_per_task: 1500000, time_cap_s: 1200, cost_cap_usd: 1.0}
+matrix:
+  condition: [closed_book, search_snippets, search_fetch, local_docs, search_docs, oracle_docs]

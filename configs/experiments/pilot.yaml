@@ -1,0 +1,18 @@
+# Pilot: 13 BrowseComp questions (1%) under two conditions (~$10 cap). Run before any larger campaign
+# and read every trajectory: `agent-eval trajectory runs/pilot <run_id> <task_id> --html t.html`
+campaign_id: pilot
+description: Smoke test of the full pipeline on live APIs.
+benchmark: {id: browsecomp, num_examples: 13, seed: 0}
+grader: {provider: anthropic, model: claude-haiku-5-5, effort: low}
+repeats: 1
+concurrency: 4
+max_cost_usd: 10.0
+defaults:
+  model: {provider: anthropic, name: claude-haiku-5-5, effort: medium, max_tokens: 16000, thinking_display: summarized}
+  harness: direct_tool
+  condition: search_fetch
+  delivery: full
+  search_backend: exa
+  limits: {step_cap: 40, token_budget_per_task: 1500000, time_cap_s: 1200, cost_cap_usd: 1.0}
+matrix:
+  condition: [closed_book, search_fetch]

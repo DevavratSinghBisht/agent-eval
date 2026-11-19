@@ -1,0 +1,8 @@
+name: agent-eval
+channels: [defaults]
+dependencies:
+  - python=3.13
+  - pip
+  - pip:
+      - -e .[dev]
+      - scipy>=1.10

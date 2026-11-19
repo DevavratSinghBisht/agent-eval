@@ -1,0 +1,17 @@
+# Delivery-policy sweep: does the model consume full results, or only what fits a truncation window?
+# Local-docs condition keeps retrieval fixed so differences come from delivery, not the web.
+campaign_id: delivery_sweep
+benchmark: {id: browsecomp_plus, num_examples: 8, seed: 0}
+grader: {provider: anthropic, model: claude-haiku-5-5, effort: low}
+repeats: 1
+concurrency: 8
+max_cost_usd: 120.0
+defaults:
+  model: {provider: anthropic, name: claude-haiku-5-5, effort: medium, max_tokens: 16000, thinking_display: summarized}
+  harness: direct_tool
+  condition: local_docs
+  search_backend: exa
+  limits: {step_cap: 50, token_budget_per_task: 1500000, time_cap_s: 1200, cost_cap_usd: 1.0}
+matrix:
+  condition: [local_docs, oracle_docs]
+  delivery: [full, truncate_2k, truncate_8k, truncate_32k, paginate_8k, summarize]

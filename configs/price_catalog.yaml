@@ -1,0 +1,40 @@
+# Versioned price catalog. Every run records `price_catalog_version`; costs are recomputed
+# from this file and never from a fallback rate. Bump `version` whenever a price changes.
+#
+# Source: Anthropic first-party API prices (claude-api skill model table, cached 2026-10-06).
+# Assumptions to verify against https://platform.claude.com/docs/en/about-claude/pricing :
+#   - cache read = 0.1x input, cache write (5-min TTL) = 1.25x input
+#   - Haiku 5.5's >100K-prompt tier applies to the whole call when total prompt tokens
+#     (uncached + cache read + cache write) exceed 100K
+# Search prices are per call, from each vendor's public pricing; adjust to your plan.
+version: "2026-11-19.1"
+
+models:
+  claude-haiku-5-5:
+    input_per_mtok: 0.10
+    output_per_mtok: 0.50
+    cache_read_multiplier: 0.1
+    cache_write_multiplier: 1.25
+    long_context_threshold: 100000
+    long_input_per_mtok: 0.50
+    long_output_per_mtok: 2.50
+  claude-sonnet-5-5:
+    input_per_mtok: 2.00
+    output_per_mtok: 10.00
+    cache_read_multiplier: 0.1
+    cache_write_multiplier: 1.25
+  claude-opus-5-5:
+    input_per_mtok: 4.00
+    output_per_mtok: 20.00
+    cache_read_multiplier: 0.05
+    cache_write_multiplier: 1.25
+  mock-model:
+    input_per_mtok: 1.00
+    output_per_mtok: 2.00
+    cache_read_multiplier: 0.1
+    cache_write_multiplier: 1.25
+
+search_per_call:
+  tavily: 0.008
+  exa: 0.005
+  mock: 0.0

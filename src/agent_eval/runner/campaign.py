@@ -67,7 +67,7 @@ class Campaign:
         self,
         exp: ExperimentConfig,
         root: str | Path | None = None,
-        client_factory: Callable[[str, str], ModelClient] = make_client,
+        client_factory: Callable[..., ModelClient] = make_client,
         grader: Grader | None = None,
         tasks: list[Task] | None = None,
     ):
@@ -77,12 +77,26 @@ class Campaign:
         self.catalog: PriceCatalog = load_catalog(exp.price_catalog)
         self.runner_version = runner_version()
         self.client_factory = client_factory
-        self.grader = grader or Grader(exp.grader, self.catalog, client_factory(exp.grader.provider, exp.grader.model))
+        g = exp.grader
+        self.grader = grader or Grader(g, self.catalog, self._client(g.provider, g.model, g.base_url, g.api_key_env))
+        # secondary judges: same responses, verdicts recorded for agreement analysis only
+        self.secondary_graders = [
+            Grader(s, self.catalog, self._client(s.provider, s.model, s.base_url, s.api_key_env))
+            for s in exp.secondary_graders
+        ]
+        ids = [self.grader.judge_id] + [s.judge_id for s in self.secondary_graders]
+        if len(set(ids)) != len(ids):
+            raise ValueError(f"judge ids must be unique, got {ids}; set `name:` on grader configs to tell them apart")
         self.tasks = tasks if tasks is not None else load_tasks(exp.benchmark)
         self.specs = plan_runs(exp)
         self.spent = 0.0
         self._lock = asyncio.Lock()
         self.stop_reason: str | None = None
+
+    def _client(self, provider: str, model: str, base_url: str | None = None, api_key_env: str | None = None) -> ModelClient:
+        """Agent, summarizer and grader clients are built independently, so each may use its own provider."""
+        conn = {k: v for k, v in (("base_url", base_url), ("api_key_env", api_key_env)) if v}
+        return self.client_factory(provider, model, **conn)
 
     # ---- bookkeeping -------------------------------------------------------------------
     def task_path(self, run_id: str, task_id: str) -> Path:
@@ -115,6 +129,7 @@ class Campaign:
             "price_catalog_version": self.catalog.version,
             "seed": spec.cfg.benchmark.seed,
             "grader_model": self.exp.grader.model,
+            "grader_provider": self.exp.grader.provider,
             "config": spec.cfg.model_dump(mode="json"),
             "task_ids": [t.task_id for t in self.tasks],
             "started_at": prior.get("started_at", time.time()),
@@ -162,7 +177,8 @@ class Campaign:
         status, error = "completed", None
         outcome = None
         try:
-            client = self.client_factory(cfg.model.provider, cfg.model.name)
+            m = cfg.model
+            client = self._client(m.provider, m.name, m.base_url, m.api_key_env)
             delivery = make_policy(cfg.delivery)
             oracle = None
             if cfg.condition == "oracle_docs":
@@ -193,8 +209,15 @@ class Campaign:
 
         response = format_response(outcome.final_answer if outcome else None, outcome.fallback_text if outcome else "")
         grade: dict[str, Any] = {}
+        judgements: list[dict[str, Any]] = []
         if status == "completed":
-            grade = await self.grader.grade(task.question, task.answer, response)
+            grades = await asyncio.gather(
+                *(g.grade(task.question, task.answer, response) for g in [self.grader, *self.secondary_graders])
+            )
+            grade = grades[0]
+            judgements = [self.grader.judgement(grade, spec.run_id, task.task_id, "primary")] + [
+                g.judgement(gr, spec.run_id, task.task_id, "secondary") for g, gr in zip(self.secondary_graders, grades[1:])
+            ]
             if grade["verdict"] is None:
                 status = "grading_error"
         fa = outcome.final_answer if outcome else None
@@ -229,7 +252,9 @@ class Campaign:
             "grader_extracted_answer": grade.get("extracted_final_answer"),
             "grader_parse_ok": grade.get("parse_ok"),
             "grader_model": grade.get("grader_model"),
+            "grader_provider": grade.get("grader_provider"),
             "grader_cost_usd": grade.get("grader_cost_usd", 0.0),
+            "secondary_grader_cost_usd": round(sum(j["cost_usd"] or 0 for j in judgements[1:]), 6),
             "grader_raw": grade.get("grader_raw"),
             "grader_error": grade.get("grader_error"),
             "finished_at": time.time(),
@@ -244,6 +269,7 @@ class Campaign:
         work = rec.close(closing)
         raw_api = work.pop("raw_api")
         work["task"] = task_row
+        work["judgements"] = judgements
         work["task_metadata"] = task.metadata
         work["question"] = task.question
         work["trajectory"]["question"] = task.question
@@ -255,7 +281,7 @@ class Campaign:
         )
         atomic_write(self.task_path(spec.run_id, task.task_id), json.dumps(work, default=str).encode())
         async with self._lock:
-            self.spent += rec.cost + task_row["grader_cost_usd"]
+            self.spent += rec.cost + task_row["grader_cost_usd"] + task_row["secondary_grader_cost_usd"]
         mark = {True: "[green]PASS[/]", False: "[red]fail[/]", None: "[yellow]n/a[/]"}[task_row["passed"]]
         console.print(
             f"{mark} {spec.run_id} {task.task_id} {cfg.condition}/{cfg.delivery} "
@@ -265,7 +291,7 @@ class Campaign:
         return work
 
     def _make_summarizer(self, cfg: RunConfig):
-        client = self.client_factory(cfg.model.provider, cfg.summarizer_model)
+        client = self._client(cfg.model.provider, cfg.summarizer_model, cfg.model.base_url, cfg.model.api_key_env)
 
         async def summarize(text: str, question: str):
             turn, _ = await client.complete(

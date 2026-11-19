@@ -5,6 +5,7 @@ silently (a fault class found in the example loss-analysis data)."""
 from __future__ import annotations
 
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 import yaml
@@ -51,11 +52,16 @@ class PriceCatalog:
     search_per_call: dict[str, float]
 
     def model(self, name: str) -> ModelPrice:
-        if name not in self.models:
-            raise PricingError(
-                f"model {name!r} not in price catalog {self.version}; add it before running"
-            )
-        return self.models[name]
+        """Exact entry first, then the first glob pattern that matches (e.g. "qwen3*" for a
+        self-hosted family). No match is a hard error: runs are never priced with a guess."""
+        if name in self.models:
+            return self.models[name]
+        for pattern, price in self.models.items():
+            if any(ch in pattern for ch in "*?[") and fnmatchcase(name, pattern):
+                return price
+        raise PricingError(
+            f"model {name!r} not in price catalog {self.version}; add it (or a matching pattern) before running"
+        )
 
     def cost(self, model: str, usage: Usage) -> float:
         return round(self.model(model).cost(usage), 6)

@@ -15,6 +15,10 @@ SIGNAL_COLS = [
 ]
 
 
+def _f(v) -> str:
+    return "n/a" if v is None or (isinstance(v, float) and pd.isna(v)) else f"{v:.3f}"
+
+
 def md_table(df: pd.DataFrame, floatfmt: str = "{:.3f}") -> str:
     if df is None or df.empty:
         return "_(no data)_\n"
@@ -76,6 +80,43 @@ def build_report(campaign_dir: str | Path) -> Path:
         parts.append(md_table(sig))
         parts.append("\n## Termination reasons\n")
         parts.append(md_table(ex.groupby(["condition_id", "delivery_policy", "termination_reason"]).size().unstack(fill_value=0)))
+
+    agr_path = d / "agreement.json"
+    if agr_path.exists():
+        agr = json.loads(agr_path.read_text(encoding="utf-8"))
+        if agr.get("pairs"):
+            parts.append("\n## Judge agreement (inter-rater reliability)\n")
+            parts.append(
+                f"Judges: {', '.join(agr['judges'])} (primary: {agr.get('primary_judge')}). Cohen's kappa is chance-corrected "
+                "agreement; Gwet's AC1 stays meaningful when pass rates are extreme (kappa collapses there). "
+                "a_only / b_only = trials passed by only one judge; McNemar p < 0.05 means one judge is systematically more lenient.\n\n"
+            )
+            rows = []
+            for p in agr["pairs"]:
+                kci, aci = p.get("kappa_ci") or [None, None], p.get("ac1_ci") or [None, None]
+                rows.append({
+                    "judge_a": p["judge_a"], "judge_b": p["judge_b"], "n": p["n"], "agreement": p["percent_agreement"],
+                    "kappa": p["cohen_kappa"], "kappa_95ci": f"[{_f(kci[0])}, {_f(kci[1])}]",
+                    "ac1": p["gwet_ac1"], "ac1_95ci": f"[{_f(aci[0])}, {_f(aci[1])}]",
+                    "a_only": p["a_only"], "b_only": p["b_only"], "mcnemar_p": p["mcnemar_p"],
+                    "pass_rate_a": p["pass_rate_a"], "pass_rate_b": p["pass_rate_b"],
+                })
+            parts.append(md_table(pd.DataFrame(rows)))
+            if agr.get("by_condition"):
+                parts.append("\nBy condition:\n\n")
+                bc = pd.DataFrame(agr["by_condition"])[["judge_a", "judge_b", "condition_id", "n", "percent_agreement",
+                                                         "cohen_kappa", "gwet_ac1", "a_only", "b_only"]]
+                parts.append(md_table(bc))
+            sr = agr.get("score_range_on_common") or {}
+            if sr.get("n_common"):
+                parts.append(f"\nHeadline pass rate on the {sr['n_common']} trials every judge graded ranges from "
+                             f"{sr['min']:.3f} to {sr['max']:.3f} depending on the judge (spread {sr['spread']:.3f}).\n")
+            if "krippendorff_alpha" in agr:
+                parts.append(f"\nKrippendorff's alpha (all judges, nominal): {agr['krippendorff_alpha']:.3f}\n")
+            contested = agr.get("contested") or []
+            parts.append(f"\nContested trials (judges disagree): {len(contested)}. Review these by hand first.\n\n")
+            if contested:
+                parts.append(md_table(pd.DataFrame(contested[:25])))
 
     labels = d / "failure_labels.csv"
     if labels.exists():

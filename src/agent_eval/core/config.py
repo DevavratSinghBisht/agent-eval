@@ -39,12 +39,18 @@ DELIVERY_POLICIES = (
 
 
 class ModelConfig(BaseModel):
+    """The agent model. `provider`: anthropic | openai | gemini | deepseek | openrouter | ollama |
+    vllm | openai_compatible (see providers/). `effort` maps to Anthropic output_config.effort or
+    OpenAI/Gemini reasoning_effort; set it to null for models without reasoning controls."""
+
     provider: str = "anthropic"
     name: str = "claude-haiku-5-5"
     effort: str | None = "medium"
     max_tokens: int = 16000
-    thinking_display: str | None = "summarized"
-    extra: dict[str, Any] = Field(default_factory=dict)
+    thinking_display: str | None = "summarized"  # Anthropic only
+    base_url: str | None = None      # override the provider preset (required for vllm / openai_compatible)
+    api_key_env: str | None = None   # env var holding the API key (overrides the provider preset)
+    extra: dict[str, Any] = Field(default_factory=dict)  # extra request fields, passed through verbatim
 
 
 class Limits(BaseModel):
@@ -56,10 +62,21 @@ class Limits(BaseModel):
 
 
 class GraderConfig(BaseModel):
+    """The judge model. Independent of the agent model and may use a different provider; using a
+    different model family than the agent avoids self-preference (the validator warns otherwise)."""
+
     provider: str = "anthropic"
     model: str = "claude-haiku-5-5"
     effort: str | None = "low"
     max_tokens: int = 4000
+    base_url: str | None = None
+    api_key_env: str | None = None
+    extra: dict[str, Any] = Field(default_factory=dict)
+    name: str | None = None  # label in judgements.csv; default "<provider>/<model>"
+
+    @property
+    def judge_id(self) -> str:
+        return self.name or f"{self.provider}/{self.model}"
 
 
 class BenchmarkConfig(BaseModel):
@@ -94,6 +111,8 @@ class ExperimentConfig(BaseModel):
     description: str = ""
     benchmark: BenchmarkConfig = Field(default_factory=BenchmarkConfig)
     grader: GraderConfig = Field(default_factory=GraderConfig)
+    # extra judges: grade the same responses for agreement analysis only (the primary grader decides `passed`)
+    secondary_graders: list[GraderConfig] = Field(default_factory=list)
     defaults: dict[str, Any] = Field(default_factory=dict)
     matrix: dict[str, list[Any]] = Field(default_factory=dict)
     repeats: int = 1

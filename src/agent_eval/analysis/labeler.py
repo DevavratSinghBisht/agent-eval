@@ -67,6 +67,7 @@ def digest(traj: dict, max_chars: int = 400) -> str:
 
 
 async def label_campaign(campaign_dir: str | Path, model: str = "claude-haiku-5-5", provider: str = "anthropic",
+                         base_url: str | None = None, effort: str | None = "low",
                          limit: int | None = None, concurrency: int = 4) -> Path:
     d = Path(campaign_dir)
     tasks = pd.read_csv(d / "tasks.csv")
@@ -76,7 +77,7 @@ async def label_campaign(campaign_dir: str | Path, model: str = "claude-haiku-5-
     failed = tasks[(tasks.task_status == "completed") & (tasks.passed == False) & (tasks.condition_id != "closed_book")]  # noqa: E712
     if limit:
         failed = failed.head(limit)
-    client = make_client(provider, model)
+    client = make_client(provider, model, base_url=base_url)
     catalog = load_catalog()
     sem = asyncio.Semaphore(concurrency)
     tax = "\n".join(f"- {k}: {v}" for k, v in TAXONOMY.items())
@@ -89,7 +90,7 @@ async def label_campaign(campaign_dir: str | Path, model: str = "claude-haiku-5-
                 answer=row.correct_answer, final=row.exact_answer, termination=row.termination_reason,
                 digest=digest(traj) if traj else "(missing)", taxonomy=tax,
             )
-            turn, _ = await client.complete("", [Message("user", text=prompt)], [], CallOptions(max_tokens=2000, effort="low"))
+            turn, _ = await client.complete("", [Message("user", text=prompt)], [], CallOptions(max_tokens=2000, effort=effort))
             m = re.search(r"\{.*\}", turn.text, re.S)
             try:
                 parsed = json.loads(m.group(0)) if m else {}

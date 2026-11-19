@@ -59,6 +59,9 @@ def validate(campaign_dir: str | Path) -> dict:
         if str(r.get("price_catalog_version")) != catalog.version:
             add("warning", "catalog_version_mismatch",
                 f"run priced with catalog {r.get('price_catalog_version')}, current is {catalog.version}; repricing check skipped", r.run_id)
+        if pd.notna(r.get("grader_model")) and r.get("grader_model") == r.model_name:
+            add("warning", "self_grading", f"agent and judge are the same model ({r.model_name}); "
+                "self-preference can inflate scores - consider a judge from another model family", r.run_id)
         if r.run_status == "partial":
             add("warning", "partial_run", f"{r.tasks_executed}/{r.tasks_expected} tasks executed; score uses tasks_expected", r.run_id)
         if "|" in str(r.get("runner_versions", "")):
@@ -153,6 +156,24 @@ def validate(campaign_dir: str | Path) -> dict:
             if abs(r.cached_share - med) > 0.3:
                 add("warning", "cached_share_anomaly",
                     f"cached share {r.cached_share:.2f} vs repeat median {med:.2f} (config {h})", r.run_id)
+
+    # ---- judge agreement (written by analysis.agreement before validation) ------------------------
+    agr_path = d / "agreement.json"
+    if agr_path.exists():
+        from .agreement import AC1_WARN, KAPPA_WARN
+
+        agr = json.loads(agr_path.read_text(encoding="utf-8"))
+        for p in agr.get("pairs", []):
+            k, ac1 = p.get("cohen_kappa"), p.get("gwet_ac1")
+            low_k = k is not None and not pd.isna(k) and k < KAPPA_WARN
+            low_ac1 = ac1 is not None and not pd.isna(ac1) and ac1 < AC1_WARN
+            if low_k or low_ac1:
+                add("warning", "low_judge_agreement",
+                    f"{p['judge_a']} vs {p['judge_b']}: kappa={k}, AC1={ac1} on {p['n']} trials; "
+                    "scores depend on the judge - review contested trials")
+            if p.get("mcnemar_p", 1) < 0.05:
+                add("warning", "judge_bias",
+                    f"{p['judge_a']} vs {p['judge_b']}: systematic disagreement ({p['a_only']} vs {p['b_only']}, McNemar p={p['mcnemar_p']:.3f})")
 
     errors = sum(f.severity == "error" for f in F)
     result = {

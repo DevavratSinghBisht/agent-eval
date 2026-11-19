@@ -25,6 +25,7 @@ RUN_META_COLS = [
     "run_id", "campaign_id", "benchmark_id", "model_name", "provider", "harness_name", "condition_id",
     "delivery_policy", "effort", "search_backend", "token_budget_per_task", "step_cap", "repeat_index",
     "repeat_group_id", "config_hash", "runner_version", "price_catalog_version", "seed", "grader_model",
+    "grader_provider",
 ]
 TOKEN_COLS = ["prompt_tokens", "cached_tokens", "cache_write_tokens", "completion_tokens"]
 
@@ -46,7 +47,7 @@ def load_work(run_dir: Path, task_id: str, run_meta: dict[str, Any]) -> dict[str
 
 def finalize(campaign_dir: str | Path, n_selected: int = 10) -> dict[str, Path]:
     campaign_dir = Path(campaign_dir)
-    runs, tasks, calls, tools = [], [], [], []
+    runs, tasks, calls, tools, judgements = [], [], [], [], []
     traj_dir = campaign_dir / "trajectories"
     traj_dir.mkdir(parents=True, exist_ok=True)
     index_rows = []
@@ -70,6 +71,7 @@ def finalize(campaign_dir: str | Path, n_selected: int = 10) -> dict[str, Path]:
             t.update(trial_signals(w))
             run_tasks.append(t)
             calls.extend(w["model_calls"])
+            judgements.extend(w.get("judgements") or _legacy_primary_judgement(w, meta))
             for tc in w["tool_calls"]:
                 flags = ev["tool_calls"].get(tc["call_id"], {})
                 dm = tc.get("delivery_meta") or {}
@@ -133,6 +135,9 @@ def finalize(campaign_dir: str | Path, n_selected: int = 10) -> dict[str, Path]:
     pd.DataFrame(tasks).to_csv(out["tasks"], index=False)
     pd.DataFrame(calls).to_csv(out["model_calls"], index=False)
     pd.DataFrame(tools).to_csv(out["tool_calls"], index=False)
+    judgements.extend(load_rejudgements(campaign_dir))
+    out["judgements"] = campaign_dir / "judgements.csv"
+    pd.DataFrame(judgements).to_csv(out["judgements"], index=False)
     cctx = zstandard.ZstdCompressor(level=10)
     (traj_dir / "archive.jsonl.zst").write_bytes(cctx.compress(raw_buf.getvalue()))
     pd.DataFrame(index_rows).to_csv(traj_dir / "trajectory_index.csv", index=False)
@@ -154,6 +159,36 @@ def finalize(campaign_dir: str | Path, n_selected: int = 10) -> dict[str, Path]:
     }
     (campaign_dir / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
     return out
+
+
+def _legacy_primary_judgement(w: dict[str, Any], meta: dict[str, Any]) -> list[dict[str, Any]]:
+    """Trials recorded before multi-judge support: rebuild the primary judge's row from the task."""
+    t = w["task"]
+    if t.get("task_status") not in ("completed", "grading_error"):
+        return []
+    model = t.get("grader_model") or meta.get("grader_model")
+    provider = t.get("grader_provider") or meta.get("grader_provider") or "anthropic"
+    verdict = t.get("grader_verdict")
+    return [{
+        "run_id": t["run_id"], "task_id": t["task_id"], "judge": f"{provider}/{model}", "role": "primary",
+        "provider": provider, "model": model, "passed": (verdict == "yes") if verdict else None,
+        "verdict": verdict, "parse_ok": t.get("grader_parse_ok"), "extracted_answer": t.get("grader_extracted_answer"),
+        "cost_usd": t.get("grader_cost_usd"), "latency_seconds": None, "error": t.get("grader_error"),
+        "raw": t.get("grader_raw"),
+    }]
+
+
+def rejudge_dir(campaign_dir: Path) -> Path:
+    return Path(campaign_dir) / "_work" / "_rejudge"
+
+
+def load_rejudgements(campaign_dir: Path) -> list[dict[str, Any]]:
+    """Verdicts added after the fact by `agent-eval rejudge` (one JSONL file per judge)."""
+    rows = []
+    for f in sorted(rejudge_dir(campaign_dir).glob("*.jsonl")):
+        with open(f, encoding="utf-8") as fh:
+            rows.extend(json.loads(line) for line in fh if line.strip())
+    return rows
 
 
 def _write_selected(d: Path, pool: list[tuple[str, dict]], n: int) -> None:

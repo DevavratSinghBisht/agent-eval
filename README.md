@@ -41,6 +41,65 @@ agent-eval compare runs/<campaign> <config_hash_a> <config_hash_b>   # paired di
 (`--retry-errored` re-runs errored/ungraded ones). Each run's results are finalized, validated and
 reported automatically (`finalize`, `validate` and `report` are also separate commands).
 
+## Models and providers
+
+The agent (`defaults.model`) and the judge (`grader:`) are configured independently, so they can
+come from different providers:
+
+```yaml
+grader: {provider: openai, model: <openai model id>, effort: low}
+defaults:
+  model: {provider: anthropic, name: claude-haiku-5-5, effort: medium}
+```
+
+| provider | API key env | notes |
+|---|---|---|
+| `anthropic` | `ANTHROPIC_API_KEY` | native Messages API: adaptive thinking, prompt caching, thinking blocks replayed |
+| `openai` | `OPENAI_API_KEY` | Chat Completions; strict tool schemas; `effort` → `reasoning_effort` |
+| `gemini` | `GEMINI_API_KEY` | Google's OpenAI-compatible endpoint; `effort` → `reasoning_effort` |
+| `deepseek`, `openrouter` | `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY` | OpenAI-compatible presets |
+| `ollama` | none | local server at `http://localhost:11434/v1` |
+| `vllm`, `openai_compatible` | `api_key_env` (optional) | any OpenAI-compatible server; `base_url` required |
+
+- `base_url` and `api_key_env` override a preset on both `model` and `grader`.
+- Set `effort: null` for models without reasoning controls.
+- `extra:` passes provider-specific request fields through unchanged.
+- Every model must be priced in `configs/price_catalog.yaml` before it runs. Glob entries like `"qwen3*"` cover self-hosted families at $0.
+- `runs.csv` records `provider` / `model_name` and `grader_provider` / `grader_model`.
+- The validator warns (`self_grading`) when the agent and judge are the same model.
+- `configs/experiments/cross_provider.yaml` is a ready template.
+- The labeller takes `--provider`, `--model` and `--base-url` too.
+
+## Judge agreement (inter-rater reliability)
+
+How much do scores depend on which judge grades them? There are two ways to get a second opinion:
+
+```yaml
+# 1. while running: extra judges grade the same responses; the primary `grader` still decides `passed`
+secondary_graders:
+  - {provider: openai, model: <model id>, effort: low}
+  - {provider: anthropic, model: claude-sonnet-5-5, effort: low, name: sonnet}   # `name` labels the judge
+```
+
+```powershell
+# 2. after the fact: re-grade a finished campaign's stored responses (no agent calls, resumable)
+agent-eval rejudge runs/<campaign> --provider anthropic --model claude-sonnet-5-5
+agent-eval agreement runs/<campaign> [--human labels.csv]   # recompute; hand labels become one more rater
+```
+
+- **Where results go:** every verdict goes to `judgements.csv` (one row per trial × judge). `finalize` then writes `agreement.json` and a **Judge agreement** section in `report.md`.
+- **Reported for each judge pair, overall and per condition:**
+  - percent agreement
+  - **Cohen's κ** with a bootstrap 95% CI
+  - **Gwet's AC1**: still meaningful when pass rates are extreme (e.g. closed-book at 0%), where κ collapses
+  - the 2×2 confusion counts
+  - a **McNemar** test: is one judge systematically more lenient?
+  - prevalence and bias indices
+  - how much the headline pass rate moves across judges
+- **3 or more judges** add Krippendorff's α.
+- **Contested trials** (where judges disagree) are listed for human review.
+- **Validator warnings:** `low_judge_agreement` (κ < 0.6 or AC1 < 0.7), `judge_bias` (McNemar p < 0.05), and `self_grading` (agent and judge are the same model).
+
 ## Experiments
 
 **Tool conditions** (`condition`):

@@ -1,0 +1,26 @@
+# Agent and judge from different providers: Claude Haiku 5.5 answers, an OpenAI model grades.
+# A judge from another model family avoids self-preference (the validator warns when they match).
+#
+# Before running:
+#   1. put OPENAI_API_KEY in .env
+#   2. add the judge model to configs/price_catalog.yaml (runs refuse unpriced models)
+#   3. set grader.model to that model id
+# Other judge options (same shape):
+#   grader: {provider: gemini,   model: <gemini model id>,   effort: low}     # GEMINI_API_KEY
+#   grader: {provider: deepseek, model: <deepseek model id>, effort: null}    # DEEPSEEK_API_KEY
+#   grader: {provider: ollama,   model: qwen3:32b,           effort: null}    # local, free
+#   grader: {provider: openai_compatible, model: my-model, base_url: http://host:8000/v1, api_key_env: MY_KEY, effort: null}
+# `effort` is passed as reasoning_effort on OpenAI/Gemini; use null for models without reasoning controls.
+campaign_id: cross_provider
+benchmark: {id: browsecomp, num_examples: 13, seed: 0}
+grader: {provider: openai, model: REPLACE-WITH-OPENAI-MODEL, effort: low, max_tokens: 4000}
+repeats: 1
+concurrency: 8
+max_cost_usd: 10.0
+defaults:
+  model: {provider: anthropic, name: claude-haiku-5-5, effort: medium, max_tokens: 16000, thinking_display: summarized}
+  harness: direct_tool
+  condition: search_fetch
+  delivery: full
+  search_backend: exa
+  limits: {step_cap: 40, token_budget_per_task: 1500000, time_cap_s: 1200, cost_cap_usd: 1.0}

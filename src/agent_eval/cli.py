@@ -8,6 +8,8 @@
   agent-eval label <campaign_dir> [--model claude-haiku-5-5] [--limit N]
   agent-eval trajectory <campaign_dir> <run_id> <task_id> [--html out.html]
   agent-eval compare <campaign_dir> <config_hash_a> <config_hash_b>
+  agent-eval rejudge <campaign_dir> --provider P --model M [--effort E|none] [--base-url U] [--name N]
+  agent-eval agreement <campaign_dir> [--human labels.csv]
 """
 
 from __future__ import annotations
@@ -32,9 +34,17 @@ def main(argv: list[str] | None = None) -> int:
         p = sub.add_parser(name); p.add_argument("campaign_dir")
     p = sub.add_parser("label"); p.add_argument("campaign_dir"); p.add_argument("--model", default="claude-haiku-5-5")
     p.add_argument("--provider", default="anthropic"); p.add_argument("--limit", type=int)
+    p.add_argument("--base-url"); p.add_argument("--effort", default="low", help="'none' for models without reasoning controls")
     p = sub.add_parser("trajectory"); p.add_argument("campaign_dir"); p.add_argument("run_id"); p.add_argument("task_id")
     p.add_argument("--html")
     p = sub.add_parser("compare"); p.add_argument("campaign_dir"); p.add_argument("a"); p.add_argument("b")
+    p = sub.add_parser("rejudge", help="grade stored responses with an extra judge (no agent calls)")
+    p.add_argument("campaign_dir"); p.add_argument("--provider", required=True); p.add_argument("--model", required=True)
+    p.add_argument("--effort", default="low", help="'none' for models without reasoning controls")
+    p.add_argument("--base-url"); p.add_argument("--api-key-env"); p.add_argument("--name")
+    p.add_argument("--concurrency", type=int, default=8); p.add_argument("--limit", type=int)
+    p = sub.add_parser("agreement", help="inter-judge agreement (Cohen's kappa, Gwet's AC1, ...)")
+    p.add_argument("campaign_dir"); p.add_argument("--human", help="CSV of hand labels: run_id, task_id, verdict")
     args = ap.parse_args(argv)
 
     if args.cmd == "prepare":
@@ -81,7 +91,8 @@ def main(argv: list[str] | None = None) -> int:
         from .analysis.labeler import label_campaign
         from .analysis.report import build_report
 
-        out = asyncio.run(label_campaign(args.campaign_dir, args.model, args.provider, args.limit))
+        effort = None if args.effort == "none" else args.effort
+        out = asyncio.run(label_campaign(args.campaign_dir, args.model, args.provider, args.base_url, effort, args.limit))
         build_report(args.campaign_dir)
         print(out)
         return 0
@@ -99,6 +110,25 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(json.dumps(traj, indent=2, ensure_ascii=False, default=str))
         return 0
+    if args.cmd == "rejudge":
+        from .core.config import GraderConfig
+        from .runner.rejudge import rejudge
+
+        cfg = GraderConfig(provider=args.provider, model=args.model, effort=None if args.effort == "none" else args.effort,
+                           base_url=args.base_url, api_key_env=args.api_key_env, name=args.name)
+        asyncio.run(rejudge(args.campaign_dir, cfg, args.concurrency, args.limit))
+        return _finalize_validate_report(Path(args.campaign_dir))
+    if args.cmd == "agreement":
+        from .analysis.agreement import write_agreement
+        from .analysis.report import build_report
+
+        res = write_agreement(args.campaign_dir, args.human)
+        if res is None:
+            print("no judgements.csv; run `agent-eval finalize` first")
+            return 1
+        _print_agreement(res)
+        build_report(args.campaign_dir)
+        return 0
     if args.cmd == "compare":
         import pandas as pd
 
@@ -115,11 +145,27 @@ def _finalize_validate_report(d: Path) -> int:
     from .analysis.validate import validate
     from .tracing.store import finalize
 
+    from .analysis.agreement import write_agreement
+
     finalize(d)
+    agreement = write_agreement(d)  # inter-judge agreement, when the campaign has 2+ judges
+    if agreement and agreement.get("pairs"):
+        _print_agreement(agreement)
     res = validate(d)
     _print_validation(res)
     print("report:", build_report(d))
     return 0 if res["ok"] else 1
+
+
+def _print_agreement(res: dict) -> None:
+    for p in res.get("pairs", []):
+        k, ac1 = p["cohen_kappa"], p["gwet_ac1"]
+        lo, hi = p.get("kappa_ci", (float("nan"), float("nan")))
+        print(f"judges {p['judge_a']} vs {p['judge_b']}: n={p['n']} agree={p['percent_agreement']:.1%} "
+              f"kappa={k:.3f} [{lo:.3f}, {hi:.3f}] AC1={ac1:.3f} | {p['a_only']} pass only under A, "
+              f"{p['b_only']} only under B (McNemar p={p['mcnemar_p']:.3f})")
+    if "krippendorff_alpha" in res:
+        print(f"Krippendorff alpha (all judges): {res['krippendorff_alpha']:.3f}")
 
 
 def _print_validation(res: dict) -> None:

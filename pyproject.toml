@@ -22,6 +22,7 @@ dependencies = [
     "bm25s>=0.2",
     "datasets>=2.18",
     "scipy>=1.10",
+    "openai>=1.40",
     "numpy>=1.24",
 ]
 
